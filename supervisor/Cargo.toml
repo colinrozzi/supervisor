@@ -13,3 +13,9 @@ crate-type = ["cdylib"]
 packr-guest = { version = "0.24", features = ["derive"] }
 packr-abi = { version = "0.24", default-features = false }
 theater-guest = { git = "https://github.com/colinrozzi/theater", rev = "c3937bdc" }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true

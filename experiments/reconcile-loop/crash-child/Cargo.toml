@@ -1,0 +1,14 @@
+[package]
+name = "crash-child"
+version = "0.1.0"
+edition = "2021"
+[workspace]
+[lib]
+crate-type = ["cdylib"]
+[dependencies]
+packr-guest = { version = "0.24", features = ["derive"] }
+packr-abi = { version = "0.24", default-features = false }
+theater-guest = { git = "https://github.com/colinrozzi/theater", rev = "c3937bdc" }
+[profile.release]
+opt-level = "s"
+lto = true

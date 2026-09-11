@@ -1,7 +1,8 @@
 # supervisor — workspace root.
-# The reusable supervision library (guest-side component actors compose) lives in
-# `supervisor/`. A running-instance actor + the RSM control face will be added as
-# the migration proceeds (see docs/DESIGN.md).
+# `supervisor/` is the reconciler actor: it reconciles reality to a declared
+# roster (spawn/monitor/respawn via theater's runtime+lifecycle primitives — no
+# library, one concrete actor; see docs/DESIGN.md). Experiments live under
+# `experiments/` (standalone crates, not workspace members).
 [workspace]
 resolver = "2"
 members = ["supervisor"]

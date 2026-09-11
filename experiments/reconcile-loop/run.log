@@ -1,0 +1,27 @@
+[95d769ce] [supervisor] init — reconciling roster
+[0d625518] [crash-child] init — arming self-terminate timer (300ms)
+[95d769ce] [supervisor] spawned crasher as 0d625518-90a6-437c-9251-82117746da45
+[95d769ce] [supervisor] roster up: 1 service(s)
+[0d625518] [crash-child] tick — self-terminating
+[95d769ce] [supervisor] crasher (0d625518-90a6-437c-9251-82117746da45) terminated — recent_restarts=0 max=5
+[90e671d2] [crash-child] init — arming self-terminate timer (300ms)
+[95d769ce] [supervisor] spawned crasher as 90e671d2-2615-42e5-a14e-3280bcd9faaa
+[90e671d2] [crash-child] tick — self-terminating
+[95d769ce] [supervisor] crasher (90e671d2-2615-42e5-a14e-3280bcd9faaa) terminated — recent_restarts=1 max=5
+[d8914036] [crash-child] init — arming self-terminate timer (300ms)
+[95d769ce] [supervisor] spawned crasher as d8914036-dac6-4210-98d4-00de09fd3a6a
+[d8914036] [crash-child] tick — self-terminating
+[95d769ce] [supervisor] crasher (d8914036-dac6-4210-98d4-00de09fd3a6a) terminated — recent_restarts=2 max=5
+[9bb914ce] [crash-child] init — arming self-terminate timer (300ms)
+[95d769ce] [supervisor] spawned crasher as 9bb914ce-379f-41db-9e89-7ae7166c5005
+[9bb914ce] [crash-child] tick — self-terminating
+[95d769ce] [supervisor] crasher (9bb914ce-379f-41db-9e89-7ae7166c5005) terminated — recent_restarts=3 max=5
+[daf39a55] [crash-child] init — arming self-terminate timer (300ms)
+[95d769ce] [supervisor] spawned crasher as daf39a55-df73-4b06-b43c-ca9f29170472
+[daf39a55] [crash-child] tick — self-terminating
+[95d769ce] [supervisor] crasher (daf39a55-df73-4b06-b43c-ca9f29170472) terminated — recent_restarts=4 max=5
+[7e26eb54] [crash-child] init — arming self-terminate timer (300ms)
+[95d769ce] [supervisor] spawned crasher as 7e26eb54-4834-4588-a801-46573798382c
+[7e26eb54] [crash-child] tick — self-terminating
+[95d769ce] [supervisor] crasher (7e26eb54-4834-4588-a801-46573798382c) terminated — recent_restarts=5 max=5
+[95d769ce] [supervisor] crash-loop on crasher (6 in 60000ms) — BLOCKED, not respawning
