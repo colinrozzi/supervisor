@@ -1,0 +1,6 @@
+/target
+**/target
+result
+result-*
+.direnv
+*.wasm

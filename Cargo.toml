@@ -1,0 +1,7 @@
+# supervisor — workspace root.
+# The reusable supervision library (guest-side component actors compose) lives in
+# `supervisor/`. A running-instance actor + the RSM control face will be added as
+# the migration proceeds (see docs/DESIGN.md).
+[workspace]
+resolver = "2"
+members = ["supervisor"]
