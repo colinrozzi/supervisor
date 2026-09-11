@@ -82,6 +82,49 @@ convenience, chain recording) become a **guest-side component** actors compose.
   external host-wedge probe and the off-box notify escalator are inherently
   outside the runtime and remain the supervisor's, unchanged by the overhaul.
 
+## The primitive contract (DECIDED with theater-dev, 2026-09-11)
+
+theater-dev decided the runtime+lifecycle contract the library composes; it's
+being built (relocation branch), exact signatures to follow. What we get:
+
+- **`runtime` (mutate):** `spawn` / `spawn-and-wait` / `stop-actor` / `kill-actor`
+  (relocated here from the supervisor handler); `(inspect)` `list-actors` +
+  `get-actor-status/state/manifest`. `list-actors` is **flat** — no lineage in the
+  runtime; the library filters to its own children-set.
+- **No `restart-actor` primitive** — recovery is a **fresh spawn** (the model has
+  no resume; state rebuilds by replay). Restart = library-composed `stop + spawn`.
+  We address children by a **stable handle** (name / node seed-pubkey) → current
+  (rotating) theater-id, so a new id on respawn is a non-issue. No identity-
+  preserving restart needed.
+- **No `update-actor-package` yet** — supervised hot-swap = library-composed
+  `stop-old + spawn-new-package` for v1 (brief restart on deploy is fine). A
+  dedicated atomic update-package is a **follow-up** primitive if/when we need
+  zero-downtime (drain in-flight) + chain continuity across a version bump.
+- **R2 — no spawn→monitor gap:** `spawn` (opt-in) atomically establishes the
+  spawner as a deliver-to-wasm **death-monitor** on the child, *before the child's
+  init runs* — so a fast/init-time crash can't slip through.
+- **L1 — `TerminationCause`** (decodable off the terminal payload): `Completed`
+  (clean) / `Failed` (crash/panic/host-error) / `Stopped` (graceful or runtime
+  shutdown) / `Killed` (force) / `PeerKilled{peer}` (fate cascade). **Restart
+  policy: respawn ONLY on `Failed`; everything else is intentional → don't
+  respawn.** (external-stop's whole job is now just "cause == Stopped/Killed".)
+- **L2 — filter is a Pattern over event case-names** → a chain-monitor records a
+  **subset** (dissolves the old amplification wedge; retires the `subscribe` bool).
+- **L3 — links + AUTO-CASCADE:** establish a `stop-self` link per fate-shared
+  child; the supervisor's own termination auto-cascades to linked children
+  (emergent ripple, each records `PeerKilled`). No explicit stop-each-at-shutdown.
+- **C1 — one callback:** single `theater:simple/lifecycle.handle-lifecycle-event`
+  for all monitored actors (the supervisor-handlers duplicate is deleted).
+- **C2 — view-scope = library:** runtime stays flat; the library owns its
+  children-set + subtree view-scope in its in-module state.
+
+**The library's per-child composition:** on `spawn` → (a) atomic terminal
+death-monitor [→ restart policy, rate-limited, on `Failed` only], (b) optional
+subset-filtered chain-monitor [→ the black box], (c) a `stop-self` link [fate].
+All land on the one `handle-lifecycle-event`; the callback dispatches on the
+payload (`TerminationCause` present → restart path; else → record path). All
+policy in the library; zero lineage in the runtime.
+
 ## Migrating from sentinel — what carries, what's dropped
 
 - CARRIES (re-expressed on the new model): crash→restart w/ rate-limit; the
