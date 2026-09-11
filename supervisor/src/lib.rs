@@ -59,7 +59,7 @@ pack_types! {
             spawn: func(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, runtime-error>,
         }
         theater:simple/lifecycle {
-            monitor: func(subject: string) -> result<_, string>,
+            monitor-filtered: func(subject: string, filter: value) -> result<_, string>,
         }
         theater:simple/timer {
             now: func() -> u64,
@@ -68,7 +68,7 @@ pack_types! {
     exports {
         theater:simple/actor.init: func(config: value) -> result<_, string>,
         theater:simple/actor.get-state: func() -> value,
-        theater:simple/lifecycle-handlers.handle-lifecycle-event: func(subject: string, event-type: string, data: list<u8>) -> result<_, string>,
+        theater:simple/lifecycle-handlers.handle-actor-event: func(subject: string, event-type: string, data: list<u8>) -> result<_, string>,
     }
 }
 
@@ -78,8 +78,13 @@ fn log(msg: String);
 #[import(module = "theater:simple/timer", name = "now")]
 fn timer_now() -> u64;
 
-#[import(module = "theater:simple/lifecycle", name = "monitor")]
-fn monitor(subject: String) -> Result<(), String>;
+// Post-#206: monitor(subject) now delivers the FULL CHAIN; monitor-filtered takes
+// an arbitrary Pattern. For crash-catch we want only terminations — woken on a
+// child's terminal event, nothing else — via the theater-guest `terminations()` preset.
+#[import(module = "theater:simple/lifecycle", name = "monitor-filtered")]
+fn monitor_filtered(subject: String, filter: Value) -> Result<(), String>;
+
+use theater_guest::filters::terminations;
 
 // runtime.spawn returns result<string, runtime-error>; import raw + parse the
 // Value. A `result<T,E>` reaches the guest either as packr-native `Value::Result`
@@ -180,11 +185,11 @@ fn config_string(v: Value) -> Option<String> {
     }
 }
 
-/// spawn + monitor one service's manifest; returns the new child id.
+/// spawn a service's manifest + watch it for terminations; returns the new child id.
 fn spawn_and_monitor(handle: &str, manifest: &str) -> Result<String, String> {
     let id = runtime_spawn(manifest)?;
-    if let Err(e) = monitor(id.clone()) {
-        log(format!("[supervisor] {} monitor({}) failed: {}", handle, id, e));
+    if let Err(e) = monitor_filtered(id.clone(), terminations()) {
+        log(format!("[supervisor] {} monitor-filtered({}) failed: {}", handle, id, e));
     }
     log(format!("[supervisor] spawned {} as {}", handle, id));
     Ok(id)
@@ -228,8 +233,8 @@ fn init(config: Value) -> Value {
     ok_unit()
 }
 
-#[export(name = "theater:simple/lifecycle-handlers.handle-lifecycle-event")]
-fn handle_lifecycle_event(input: Value) -> Value {
+#[export(name = "theater:simple/lifecycle-handlers.handle-actor-event")]
+fn handle_actor_event(input: Value) -> Value {
     // Host passes Tuple[subject, event-type, data].
     let (subject, event_type) = match &input {
         Value::Tuple(items) if items.len() >= 2 => {
@@ -240,8 +245,10 @@ fn handle_lifecycle_event(input: Value) -> Value {
         _ => return ok_unit(),
     };
 
-    // Only terminations drive the reconcile (v0/exp1: non-terminal events are
-    // the future `record` path). "terminated" per LIFECYCLE_EVENT_TYPES.
+    // We subscribed with monitor-filtered(terminations()), so we're woken only on
+    // terminals — but guard anyway (cheap, and keeps the handler honest if the
+    // filter ever widens). exp1 respawns on ANY terminated; gating on
+    // TerminationCause::Failed is #9 (needs pack-dev's panic-trap fix to produce Failed).
     if event_type != "terminated" {
         return ok_unit();
     }

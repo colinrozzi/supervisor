@@ -8,11 +8,12 @@ description = "Theater's reconciler: spawn + manage a declared roster of service
 crate-type = ["cdylib"]
 
 # Fleet baseline (post engine-axis overhaul): packr-guest 0.24 + theater-guest.
-# Pinned to theater @ 00b0bf93 for now; bump as the wave settles.
+# Pinned to theater @ c197d707 (post-#206: full-chain monitor + monitor-filtered
+# + handle-actor-event). Bump as the lifecycle reshape wave settles.
 [dependencies]
 packr-guest = { version = "0.24", features = ["derive"] }
 packr-abi = { version = "0.24", default-features = false }
-theater-guest = { git = "https://github.com/colinrozzi/theater", rev = "c3937bdc" }
+theater-guest = { git = "https://github.com/colinrozzi/theater", rev = "c197d707f26ad0b135f1c629e6ac7c2870aa7206" }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 
