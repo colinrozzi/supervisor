@@ -1,13 +1,19 @@
-//! # supervisor — the reconciler actor (v0, Experiment 1)
+//! # supervisor — the reconciler actor (v0)
 //!
 //! Holds a roster (from init config) and reconciles reality to it: spawn each
-//! declared service + `monitor` it; when one terminates, respawn it (rate-limited)
-//! — edge-triggered on `handle-lifecycle-event(event-type == "terminated")`.
-//! (Level-triggered timer reconcile + `record` sink + live roster mutation are
-//! the next experiments; see docs/DESIGN.md.)
+//! declared service + watch it; when one terminates, respawn it (rate-limited)
+//! — edge-triggered on `handle-actor-event(event-type == "terminated")`.
 //!
-//! Composes theater primitives directly (post-#204 @ c3937bdc): `runtime.spawn`,
-//! `lifecycle.monitor`, `timer.now`, `self.log`. No supervisor handler, no store.
+//! Per-service `record` (opt-in flight-recorder): watch the child's FULL chain and
+//! POST every event to a sink URL via the http-client handler. (File sink arrives
+//! when theater ports the filesystem handler.)
+//!
+//! Composes theater primitives directly (post-#206 @ c197d707): `runtime.spawn`,
+//! `lifecycle.monitor`/`monitor-filtered`, `http-client.request`, `timer.now`,
+//! `self.log`. No supervisor handler, no store.
+//!
+//! (Level-triggered timer reconcile + respawn-only-on-Failed + live roster mutation
+//! are the next steps; see docs/DESIGN.md.)
 
 #![no_std]
 extern crate alloc;
@@ -51,6 +57,21 @@ pack_types! {
         spawn-failed(spawn-failure),
         internal(string),
     }
+    record http-header {
+        name: string,
+        value: string,
+    }
+    record http-request {
+        method: string,
+        url: string,
+        headers: list<http-header>,
+        body: option<list<u8>>,
+    }
+    record http-response {
+        status: u16,
+        headers: list<http-header>,
+        body: option<list<u8>>,
+    }
     imports {
         theater:simple/self {
             log: func(msg: string),
@@ -59,7 +80,11 @@ pack_types! {
             spawn: func(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, runtime-error>,
         }
         theater:simple/lifecycle {
+            monitor: func(subject: string) -> result<_, string>,
             monitor-filtered: func(subject: string, filter: value) -> result<_, string>,
+        }
+        theater:simple/http-client {
+            request: func(req: http-request) -> result<http-response, string>,
         }
         theater:simple/timer {
             now: func() -> u64,
@@ -78,13 +103,107 @@ fn log(msg: String);
 #[import(module = "theater:simple/timer", name = "now")]
 fn timer_now() -> u64;
 
-// Post-#206: monitor(subject) now delivers the FULL CHAIN; monitor-filtered takes
-// an arbitrary Pattern. For crash-catch we want only terminations — woken on a
-// child's terminal event, nothing else — via the theater-guest `terminations()` preset.
+// Post-#206: monitor(subject) delivers the FULL CHAIN (Pattern::any); monitor-filtered
+// takes an arbitrary Pattern. A recording service uses the full-chain monitor (record
+// every event); a plain service uses monitor-filtered(terminations()) — woken only on
+// a child's terminal event — via the theater-guest `terminations()` preset.
+#[import(module = "theater:simple/lifecycle", name = "monitor")]
+fn monitor(subject: String) -> Result<(), String>;
 #[import(module = "theater:simple/lifecycle", name = "monitor-filtered")]
 fn monitor_filtered(subject: String, filter: Value) -> Result<(), String>;
 
 use theater_guest::filters::terminations;
+
+// http-client.request(req: http-request) -> result<http-response, string>. Records cross
+// the boundary as `Value` (a Value::Record), so import raw and hand-build the request.
+#[import(module = "theater:simple/http-client", name = "request")]
+fn http_request_raw(req: Value) -> Value;
+
+/// Lowercase hex of raw bytes (no_std, no dep) — how a chain event's `data` is carried
+/// in the recorded JSON so the sink gets a faithful, inspectable copy.
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
+    }
+    s
+}
+
+/// Minimal JSON string escaping (quotes + backslashes + control) for the small,
+/// mostly-safe fields we emit (handles, ids, event types).
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// POST `body` as application/json to `url` via the http-client handler.
+/// Returns the response status, or an error string.
+fn http_post_json(url: &str, body: Vec<u8>) -> Result<u16, String> {
+    let header = Value::Record {
+        type_name: String::from("http-header"),
+        fields: vec![
+            (String::from("name"), Value::String(String::from("content-type"))),
+            (String::from("value"), Value::String(String::from("application/json"))),
+        ],
+    };
+    let req = Value::Record {
+        type_name: String::from("http-request"),
+        fields: vec![
+            (String::from("method"), Value::String(String::from("POST"))),
+            (String::from("url"), Value::String(String::from(url))),
+            (
+                String::from("headers"),
+                Value::List { elem_type: ValueType::Record(String::from("http-header")), items: vec![header] },
+            ),
+            (
+                String::from("body"),
+                Value::Option {
+                    inner_type: ValueType::List(Box::new(ValueType::U8)),
+                    value: Some(Box::new(Value::List {
+                        elem_type: ValueType::U8,
+                        items: body.into_iter().map(Value::U8).collect(),
+                    })),
+                },
+            ),
+        ],
+    };
+    // response is result<http-response, string>; http-response.status is the u16 we want.
+    let status_of = |resp: Value| -> u16 {
+        if let Value::Record { fields, .. } = resp {
+            for (k, v) in fields {
+                if k == "status" {
+                    return match v {
+                        Value::U16(s) => s,
+                        Value::U32(s) => s as u16,
+                        _ => 0,
+                    };
+                }
+            }
+        }
+        0
+    };
+    match http_request_raw(req) {
+        Value::Result { value: Ok(resp), .. } => Ok(status_of(*resp)),
+        Value::Result { value: Err(e), .. } => Err(error_case(*e)),
+        Value::Variant { tag: 0, payload, .. } => Ok(payload.into_iter().next().map(status_of).unwrap_or(0)),
+        Value::Variant { tag: 1, payload, .. } => {
+            Err(payload.into_iter().next().map(error_case).unwrap_or_else(|| String::from("unknown")))
+        }
+        _ => Err(String::from("http-client: unexpected result")),
+    }
+}
 
 // runtime.spawn returns result<string, runtime-error>; import raw + parse the
 // Value. A `result<T,E>` reaches the guest either as packr-native `Value::Result`
@@ -137,6 +256,14 @@ struct ServiceCfg {
     max: Option<u32>,
     #[serde(default)]
     window_ms: Option<u64>,
+    /// Opt-in flight-recorder: monitor this service's FULL chain and POST every
+    /// event to `record.url`. (v0 sink = http; file arrives when the fs handler lands.)
+    #[serde(default)]
+    record: Option<RecordCfg>,
+}
+#[derive(Deserialize)]
+struct RecordCfg {
+    url: String,
 }
 
 // ---- state (in-module cell; a chain projection) ----------------------------
@@ -156,6 +283,9 @@ struct Svc {
     current_id: String,
     restarts: Vec<u64>,
     blocked: bool,
+    /// Flight-recorder sink URL (None = not recording) + a per-service event counter.
+    record_url: Option<String>,
+    rec_seq: u64,
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -185,13 +315,18 @@ fn config_string(v: Value) -> Option<String> {
     }
 }
 
-/// spawn a service's manifest + watch it for terminations; returns the new child id.
-fn spawn_and_monitor(handle: &str, manifest: &str) -> Result<String, String> {
+/// spawn a service's manifest + watch it; returns the new child id.
+/// `record` true → watch the FULL chain (record every event); false → only terminations.
+fn spawn_and_watch(handle: &str, manifest: &str, record: bool) -> Result<String, String> {
     let id = runtime_spawn(manifest)?;
-    if let Err(e) = monitor_filtered(id.clone(), terminations()) {
-        log(format!("[supervisor] {} monitor-filtered({}) failed: {}", handle, id, e));
+    let sub = if record { monitor(id.clone()) } else { monitor_filtered(id.clone(), terminations()) };
+    if let Err(e) = sub {
+        log(format!("[supervisor] {} watch({}) failed: {}", handle, id, e));
     }
-    log(format!("[supervisor] spawned {} as {}", handle, id));
+    log(format!(
+        "[supervisor] spawned {} as {}{}",
+        handle, id, if record { " (recording full chain)" } else { "" }
+    ));
     Ok(id)
 }
 
@@ -210,8 +345,9 @@ fn init(config: Value) -> Value {
 
     let mut services: Vec<Svc> = Vec::new();
     for s in cfg.services {
-        // initial reconcile: desired-absent -> spawn + monitor.
-        let current_id = match spawn_and_monitor(&s.handle, &s.manifest) {
+        let record_url = s.record.map(|r| r.url);
+        // initial reconcile: desired-absent -> spawn + watch.
+        let current_id = match spawn_and_watch(&s.handle, &s.manifest, record_url.is_some()) {
             Ok(id) => id,
             Err(e) => {
                 // A hard spawn failure at init is fatal — the operator needs to know.
@@ -226,6 +362,8 @@ fn init(config: Value) -> Value {
             current_id,
             restarts: Vec::new(),
             blocked: false,
+            record_url,
+            rec_seq: 0,
         });
     }
     log(format!("[supervisor] roster up: {} service(s)", services.len()));
@@ -236,19 +374,48 @@ fn init(config: Value) -> Value {
 #[export(name = "theater:simple/lifecycle-handlers.handle-actor-event")]
 fn handle_actor_event(input: Value) -> Value {
     // Host passes Tuple[subject, event-type, data].
-    let (subject, event_type) = match &input {
+    let (subject, event_type, data) = match &input {
         Value::Tuple(items) if items.len() >= 2 => {
             let s = if let Value::String(s) = &items[0] { s.clone() } else { String::from("?") };
             let e = if let Value::String(e) = &items[1] { e.clone() } else { String::from("?") };
-            (s, e)
+            let d = match items.get(2) {
+                Some(Value::List { items, .. }) => {
+                    items.iter().filter_map(|x| if let Value::U8(b) = x { Some(*b) } else { None }).collect()
+                }
+                _ => Vec::new(),
+            };
+            (s, e, d)
         }
         _ => return ok_unit(),
     };
 
-    // We subscribed with monitor-filtered(terminations()), so we're woken only on
-    // terminals — but guard anyway (cheap, and keeps the handler honest if the
-    // filter ever widens). exp1 respawns on ANY terminated; gating on
-    // TerminationCause::Failed is #9 (needs pack-dev's panic-trap fix to produce Failed).
+    // Flight-recorder: a recording service watches its child's FULL chain, so POST
+    // every event to the sink. (A plain service is subscribed terminations-only and
+    // never reaches here for non-terminals.) Read url + bump seq under a short borrow,
+    // then POST outside it.
+    let sink = SupervisorState::with_mut(|st| {
+        st.services
+            .iter_mut()
+            .find(|s| s.current_id == subject && s.record_url.is_some())
+            .map(|s| {
+                let seq = s.rec_seq;
+                s.rec_seq += 1;
+                (s.record_url.clone().unwrap_or_default(), s.handle.clone(), seq)
+            })
+    });
+    if let Some((url, handle, seq)) = sink {
+        let json = format!(
+            "{{\"handle\":\"{}\",\"child\":\"{}\",\"type\":\"{}\",\"seq\":{},\"data_hex\":\"{}\"}}",
+            json_escape(&handle), json_escape(&subject), json_escape(&event_type), seq, hex(&data)
+        );
+        match http_post_json(&url, json.into_bytes()) {
+            Ok(status) => log(format!("[supervisor] recorded {} seq={} type={} -> http {}", handle, seq, event_type, status)),
+            Err(e) => log(format!("[supervisor] record POST failed ({} seq={}): {}", handle, seq, e)),
+        }
+    }
+
+    // Only terminations drive the reconcile. exp1 respawns on ANY terminated; gating
+    // on TerminationCause::Failed is #9 (needs pack-dev's panic-trap fix to emit Failed).
     if event_type != "terminated" {
         return ok_unit();
     }
@@ -283,10 +450,11 @@ fn handle_actor_event(input: Value) -> Value {
             ));
             return;
         }
-        // Reconcile: desired-but-now-absent -> respawn.
+        // Reconcile: desired-but-now-absent -> respawn (recording carries across incarnations).
         let handle = svc.handle.clone();
         let manifest = svc.manifest.clone();
-        match spawn_and_monitor(&handle, &manifest) {
+        let record = svc.record_url.is_some();
+        match spawn_and_watch(&handle, &manifest, record) {
             Ok(new_id) => {
                 let svc = &mut st.services[idx];
                 svc.current_id = new_id;

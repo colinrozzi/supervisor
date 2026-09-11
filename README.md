@@ -41,10 +41,13 @@ One actor. Roster arrives in its **init config**. Handlers: `runtime` +
 `lifecycle` + `timer` (the reconcile tick) + `filesystem`/`http-client` (the
 record sink). Per-entry: `{ handle, manifest (fs or http ref), restart?, record? }`.
 
-- **Reconcile:** spawn declared-absent + monitor; respawn `Failed` (rate-limited).
-  Level-triggered on a timer, nudged by `handle-lifecycle-event`.
-- **`record`** (opt-in per service): monitor that actor's chain, write its events
-  to a file or network sink — the flight-recorder / black box, as a roster arg.
+- **Reconcile:** spawn declared-absent + monitor; respawn on termination (rate-limited).
+  Nudged by `handle-actor-event`. (Gating respawn on `Failed` only is pending a theater
+  panic-trap fix; see `experiments/reconcile-loop`.)
+- **`record`** (opt-in per service, **built** — `experiments/record`): watch that actor's
+  **full chain** and POST every event to a sink URL via the http-client handler — the
+  flight-recorder / black box, as a roster arg. (Sink is HTTP today; a `file` sink lands
+  when theater ports the filesystem handler.)
 
 Everything past v0 — live roster mutation over the network, git-served rosters,
 deploy/hot-swap, the external stall-probe, off-box notify — is "another way to

@@ -57,6 +57,11 @@ manifest : a filesystem path or http(s):// ref — served from a git repo; passe
 restart  : policy — strategy (on-failure | always | never) + rate-limit (max/window)
 record?  : OPTIONAL — monitor this actor's chain, write its events to a sink
            (a file, or an http(s) endpoint). The flight-recorder / black box, opt-in.
+           BUILT (experiments/record): a recording service is watched full-chain
+           (bare monitor); handle-actor-event POSTs every event to record.url via the
+           http-client handler. Sink is HTTP-only for now — theater has no filesystem
+           handler in the open registry yet (only an in-progress doc), so the `file`
+           sink waits on that; the `{url}` arg gains a `kind` when it lands.
 ```
 
 **State** (in a `#[derive(State)]` cell; a chain projection): `desired` (the
