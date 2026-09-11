@@ -1,60 +1,51 @@
 # supervisor
 
-Theater's userland supervisor — the OTP-`supervisor` for the theater actor runtime.
+Theater's reconciler — a declarative service-manager for the theater actor runtime.
 
-> **Migration in progress:** this project is the fresh start of what was
-> **sentinel**. We're moving from `sentinel` → `supervisor` (name + identity +
-> mailbox `supervisor-dev@colinrozzi.com`). The old `sentinel` repo is the
-> reference we migrate *from*, not a codebase we mutate in place — this is a
-> clean rebuild on the post-overhaul theater primitives.
+> **Migration in progress:** this is the fresh rebuild of what was **sentinel**,
+> on the post-overhaul theater. The old `sentinel` repo is the reference we
+> migrate *from*, not code we mutate in place.
 
-## Why this exists (the identity)
+## The model: reconcile reality to a declared roster
 
-Theater's recent overhaul **dissolved the supervisor _handler_** into two runtime
-primitives:
+You give the supervisor a **roster** — a declared set of services (each: a
+handle + a manifest to run + a restart policy). Its whole job is a **reconcile
+loop** that, *at all times, works to make reality match the roster*: spawn what's
+declared-but-absent, restart what crashed, (later) stop what's no longer declared.
 
-- **`runtime`** — control: `spawn` / `resume` / `stop-actor` / `kill-actor` /
-  `restart-actor` / `update-actor-package` (permission-gated).
-- **`lifecycle`** — watching: a directed subscription `{subscriber, subject,
-  filter, target}` where `target: stop-self` is a **link** (runtime-level
-  fate-sharing) and `target: deliver-to-wasm` is a **monitor** (filtered events
-  delivered to `handle-lifecycle-event`).
+This is declarative desired-state reconciliation — the Kubernetes / systemd /
+Nomad shape, for theater actors. The roster is *desired state* (spec); the live
+process table is *actual state* (status); the supervisor drives actual → desired.
+"Manage the fleet" is not a pile of imperative commands — it's **edit the desired
+state, and the supervisor reconciles.** Restart, add/remove, deploy — all just
+edits to the roster.
 
-The runtime now holds **no lineage** — just a flat set of live actors. Supervision
-is therefore *"a pattern, not a primitive"* (theater's own words): you compose it
-from `runtime` (start/stop) + `lifecycle` (watch/link) + **policy that lives in the
-actor**.
+Where rosters ultimately come from (a git repo the supervisor reconciles against
+= **GitOps for actors**) is the direction; see `docs/DESIGN.md`.
 
-**But you shouldn't rewrite that pattern in every supervising actor** — Erlang
-doesn't; it ships OTP `supervisor` as a library. **This project is that library**
-(plus the canonical running instance). Supervision left the runtime and landed
-here. So we name it what it is: `supervisor`.
+## Built on theater primitives, not a supervisor handler
 
-## Shape (two things)
+Theater's overhaul dissolved the supervisor *handler* into two runtime
+primitives, and the supervisor composes them directly (no dedicated handler, and
+— for now — no reusable library; it's one concrete actor):
 
-1. **The library** (`supervisor/`) — a reusable guest-side component any actor
-   composes to become a supervisor: spawn children via `runtime`, monitor them via
-   `lifecycle`, apply a restart strategy (rate-limit / intensity), track its own
-   direct-children set + view-scope, and record their chains (the black box).
-2. **The instance** — a running supervisor actor (the fleet's supervisor of prod
-   nodes: mesh nodes, the mail spine, etc.), which is just an actor that composes
-   (1) + a control face.
+- **`runtime`** — `spawn` / `stop-actor` / `kill-actor` / `list-actors` (the
+  control mechanism; the runtime is flat, holds no lineage).
+- **`lifecycle`** — `monitor` (watch an actor's events → `handle-lifecycle-event`)
+  and `link` (fate-share). All *policy* — restart strategy, what to record — lives
+  here in the supervisor.
 
-## Facets, unified under "supervision"
+## v0 (what we're building first)
 
-What used to read as separate sentinel features are all *things a supervisor does*:
+One actor. Roster arrives in its **init config**. Handlers: `runtime` +
+`lifecycle` + `timer` (the reconcile tick) + `filesystem`/`http-client` (the
+record sink). Per-entry: `{ handle, manifest (fs or http ref), restart?, record? }`.
 
-- **Flight recorder** = the supervisor's **black box** — accumulate a child's
-  chain via a filtered `lifecycle` monitor; seal + persist on the terminal event;
-  serve it on query (post-mortem debugging for the fleet).
-- **Deploy hook** = **supervised hot-swap** — `runtime.update-actor-package` on a
-  supervised child.
-- **Mesh control face** = **driving the supervisor remotely** — the RSM
-  control-plane (`control-sm` rules + a mesh-faced system), so other actors manage
-  children over the mesh.
+- **Reconcile:** spawn declared-absent + monitor; respawn `Failed` (rate-limited).
+  Level-triggered on a timer, nudged by `handle-lifecycle-event`.
+- **`record`** (opt-in per service): monitor that actor's chain, write its events
+  to a file or network sink — the flight-recorder / black box, as a roster arg.
 
-## Status
-
-KICKOFF — migration from `sentinel` beginning (see `docs/DESIGN.md`). Reference:
-the `sentinel` repo (legacy phase-1/3 TCP supervisor + the `control/` RSM
-control-plane + `docs/mesh-supervision-spec.md`).
+Everything past v0 — live roster mutation over the network, git-served rosters,
+deploy/hot-swap, the external stall-probe, off-box notify — is "another way to
+feed or edit the same desired state." See `docs/DESIGN.md`.

@@ -2,10 +2,10 @@
 name = "supervisor"
 version = "0.0.1"
 edition = "2021"
-description = "Theater's userland supervisor: compose runtime + lifecycle into a supervision pattern (the OTP-supervisor for theater)."
+description = "Theater's reconciler: spawn + manage a declared roster of services, reconciling reality to desired state (declarative service-manager for theater)."
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
 
 # Fleet baseline (post engine-axis overhaul): packr-guest 0.24 + theater-guest.
 # Pinned to theater @ 00b0bf93 for now; bump as the wave settles.

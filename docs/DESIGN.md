@@ -1,136 +1,102 @@
-# supervisor — design (migration kickoff)
+# supervisor — design
 
-Status: KICKOFF 2026-09-11. Captures the decisions from the sentinel→supervisor
-revisit. This is a clean rebuild on the post-overhaul theater, not a port of the
-old code.
+Status: v0 DESIGN LOCKED 2026-09-11 (the sentinel→supervisor revisit). A clean
+rebuild on the post-overhaul theater; not a port of the old code.
 
-## The two overhauls that forced the revisit
+## 1. The model — reconcile reality to a declared roster
 
-1. **Sentinel-side (RSM control-plane).** Sentinel gained a *mesh face*:
-   `control-sm` (rules: membership + `command_allow` + `(author,corr_id)` journal)
-   ⊕ mesh core ⊕ a custom effectful system, so actors drive supervision over the
-   mesh (`list`/`start`/`stop`/`get_chain`). Plus the flight-recorder
-   (persist-at-death + `get_chain`).
-2. **Theater-side (engine-axis + supervision rebuild).** Theater migrated onto a
-   packr-core **capture-based runtime** (wasmtime ripped → browser/embedded
-   portable), **in-module state** (state left the call surface; it's a replayable
-   projection of the chain), an **open handler registry**, and — the big one —
-   **supervision rebuilt as Erlang-style links/monitors** (PR #167).
+The supervisor holds a **roster** (declared *desired* state: the set of services
+that should be running) and runs a **reconcile loop** that continuously drives
+*actual* → *desired*. Declarative desired-state reconciliation (k8s / systemd /
+Nomad), for theater actors.
 
-## The new supervision model (theater)
+- **Spec vs status.** The roster is pure *spec* (what should run). Current ids,
+  restart counts, health, last-cause are *status* — derived by the supervisor,
+  held separately, never in the roster.
+- **Everything is an edit to desired.** Restart-on-crash = the loop noticing a
+  `Failed` actor is now desired-but-absent → respawn. Add/remove = edit the
+  roster → reconcile. Deploy = edit a manifest → reconcile. One mechanism, not
+  three subsystems.
+- **Level-triggered, edge-nudged.** A periodic full diff (self-heals even if an
+  event is missed) that events (`handle-lifecycle-event`, roster changes) nudge
+  to run sooner.
+- **Direction: GitOps for actors.** Rosters + manifests served from git repos;
+  the supervisor reconciles reality to the repo. (v0 seeds the roster from init;
+  git/filesystem/network feeding is a future feed method.)
 
-One directed primitive, a **lifecycle subscription** `{subscriber, subject,
-filter, target}`:
+## 2. Built on theater primitives (post-#204, rev c3937bdc)
 
-- `filter` — predicate over raw chain-event types, applied **host-side** (a
-  non-matching event never enters wasm; kills the old subscribe-firehose cost).
-- `target: stop-self` → **link** (runtime stops the subscriber; fate-sharing; no
-  wasm).
-- `target: deliver-to-wasm` → **monitor** (event → `handle-lifecycle-event`; the
-  actor filters + reacts = **policy in the actor**).
+Theater dissolved the supervisor *handler*; the supervisor composes the primitives
+directly. **No supervisor handler. No reusable library (yet) — one concrete
+actor** (a library is premature with a single consumer; extract later only if a
+real second consumer earns it — and the single-central-service-manager model
+suggests there won't be one).
 
-Runtime holds no lineage (flat actor set). Only runtime action is `stop-self`;
-everything richer (restart, cascade) is a monitor where the actor decides.
+- **`runtime`** (mutate: spawn / stop-actor / kill-actor; inspect: list-actors /
+  get-*). Flat — no lineage; the supervisor owns "who I run" in its own state.
+- **`lifecycle`** — `monitor` / `monitor-filtered` (watch → `handle-lifecycle-event`),
+  `link` (fate = stop-self, auto-cascades on the supervisor's own death),
+  `subscribe-to-spawns` (births). Terminal events carry `TerminationCause`
+  (`Completed`/`Failed`/`Stopped`/`Killed`/`PeerKilled`) — **respawn only on
+  `Failed`**; the rest are intentional.
 
-## Decisions taken in the revisit
+## 3. v0 — what we build first
 
-### D1 — Drop the TCP command surface (legacy)
-Sentinel carried *two* control surfaces: the old TCP+bearer JSON one
-(`list`/`start`/`stop`/`get_chain`/`mesh_submit`) and the mesh RSM control-plane.
-The mesh face supersedes it. Retiring TCP deletes: the `tcp` handler, the bearer
-token + its `store` use, and all `cmd_*`/dispatch/JSON-request machinery. **One
-control path (mesh).**
+**One actor.** Handlers: `runtime` + `lifecycle` + `timer` (reconcile tick) +
+`filesystem`/`http-client` (the record sink). **No `store` handler** (manifests
+are resolved by `spawn` from fs/http refs; no store-backed anything), **no TCP
+command surface**, **no library**.
 
-### D2 — Remove `subscribe-to-child`; watching goes through `lifecycle` monitors
-Death detection needs no subscribe (spawning auto-wires the death callback).
-`subscribe-to-child` only bought non-terminal chain events — exactly what a
-**filtered** `lifecycle` monitor does, but host-side-filtered and not limited to
-children. Bonus: filtering dissolves the old chain-amplification wedge that forced
-the per-child `subscribe=false` opt-out (sentinel #26) — so that opt-out + the
-`subscribe` bool go away too.
+**Roster** arrives in the actor's **init config** (`initial_state`). Each entry:
 
-### D3 — Remove the supervisor *handler* entirely
-Every responsibility distributes cleanly:
-- spawn / stop-child → **`runtime`** (already has spawn/stop/kill/restart).
-- watch / death → **`lifecycle`** monitor.
-- fate-sharing / stop-children-on-teardown → **`lifecycle`** links.
-- restart *policy* → the actor.
-- children-set + view-scope → the supervising actor's own in-module state.
-So supervision is a **pattern composed from `runtime` + `lifecycle`** — no
-dedicated handler.
+```
+handle   : stable name (map key; how you address it; survives respawn)
+manifest : a filesystem path or http(s):// ref — served from a git repo; passed
+           straight to runtime.spawn (theater resolves it). Carries package +
+           initial_state + handlers. (v0: manifest-only — no separate package/init.)
+restart  : policy — strategy (on-failure | always | never) + rate-limit (max/window)
+record?  : OPTIONAL — monitor this actor's chain, write its events to a sink
+           (a file, or an http(s) endpoint). The flight-recorder / black box, opt-in.
+```
 
-### D4 — The reusable supervisor pattern is a LIBRARY, not a handler
-Erlang keeps the VM primitive-only and ships OTP `supervisor` as a library. We do
-the same: primitives in `runtime`+`lifecycle`; the reusable bits (restart strategy
-/ intensity limits, direct-children bookkeeping, view-scope, spawn-then-monitor
-convenience, chain recording) become a **guest-side component** actors compose.
-**This project is that library** (+ the running instance). → the rename.
+**State** (in a `#[derive(State)]` cell; a chain projection): `desired` (the
+roster) + `actual` (per-service: current id, restart timestamps, blocked).
 
-## Open questions (to resolve as we build)
+**Reconcile:** on init + each timer tick + each `handle-lifecycle-event`, diff
+desired vs actual and act — spawn declared-absent (+ monitor, + `record` sink if
+set, + link if set); on a `Failed` terminal, respawn subject to the rate-limiter,
+or block + (later) escalate. (Stop-the-undesired only bites once the roster can
+change — v0.1.)
 
-- **Auto-death-monitor ergonomics.** Without the supervisor handler you
-  `runtime.spawn` then explicitly `lifecycle`-monitor. The library bundles
-  "spawn-and-monitor" into one call so it's not extra ceremony.
-- **View-scope for `runtime.list-actors` `scope: subtree`.** With no supervisor
-  handler to answer from a direct-children set, subtree-scope becomes the
-  supervising actor's own bookkeeping (or `list-actors` goes flat + caller
-  filters). → a question for theater-dev; both handle-lifecycle-event definitions
-  (supervisor-handlers.pact AND lifecycle-handlers.pact) are a smell to resolve.
-- **Instance vs library split** — what the canonical running supervisor is vs what
-  any actor pulls in.
-- **Notify / stall-probe** (carried over from sentinel, still out-of-band): the
-  external host-wedge probe and the off-box notify escalator are inherently
-  outside the runtime and remain the supervisor's, unchanged by the overhaul.
+## 4. Deferred (all "another way to feed/edit the same desired state")
 
-## The primitive contract (DECIDED with theater-dev, 2026-09-11)
+- **Live roster mutation over the network** (v0.1) — networked clients add/remove
+  services. This is the RSM control-plane (`control-sm`) **reframed declaratively**:
+  clients author desired-state edits; the supervisor reconciles.
+- **Git-served / filesystem rosters** — the GitOps feed.
+- **Deploy / hot-swap** — edit a manifest → reconcile (stop-old/spawn-new); a
+  dedicated atomic `update-package` (drain + chain-continuity) if zero-downtime is
+  needed.
+- **External stall-probe** (host-wedge class) + **off-box notify escalator** (#43)
+  — inherently outside the runtime; carried from sentinel's mesh-supervision spec.
+- **A reusable supervisor library** — only if a real second consumer appears.
 
-theater-dev decided the runtime+lifecycle contract the library composes; it's
-being built (relocation branch), exact signatures to follow. What we get:
+## 5. Migration from sentinel
 
-- **`runtime` (mutate):** `spawn` / `spawn-and-wait` / `stop-actor` / `kill-actor`
-  (relocated here from the supervisor handler); `(inspect)` `list-actors` +
-  `get-actor-status/state/manifest`. `list-actors` is **flat** — no lineage in the
-  runtime; the library filters to its own children-set.
-- **No `restart-actor` primitive** — recovery is a **fresh spawn** (the model has
-  no resume; state rebuilds by replay). Restart = library-composed `stop + spawn`.
-  We address children by a **stable handle** (name / node seed-pubkey) → current
-  (rotating) theater-id, so a new id on respawn is a non-issue. No identity-
-  preserving restart needed.
-- **No `update-actor-package` yet** — supervised hot-swap = library-composed
-  `stop-old + spawn-new-package` for v1 (brief restart on deploy is fine). A
-  dedicated atomic update-package is a **follow-up** primitive if/when we need
-  zero-downtime (drain in-flight) + chain continuity across a version bump.
-- **R2 — no spawn→monitor gap:** `spawn` (opt-in) atomically establishes the
-  spawner as a deliver-to-wasm **death-monitor** on the child, *before the child's
-  init runs* — so a fast/init-time crash can't slip through.
-- **L1 — `TerminationCause`** (decodable off the terminal payload): `Completed`
-  (clean) / `Failed` (crash/panic/host-error) / `Stopped` (graceful or runtime
-  shutdown) / `Killed` (force) / `PeerKilled{peer}` (fate cascade). **Restart
-  policy: respawn ONLY on `Failed`; everything else is intentional → don't
-  respawn.** (external-stop's whole job is now just "cause == Stopped/Killed".)
-- **L2 — filter is a Pattern over event case-names** → a chain-monitor records a
-  **subset** (dissolves the old amplification wedge; retires the `subscribe` bool).
-- **L3 — links + AUTO-CASCADE:** establish a `stop-self` link per fate-shared
-  child; the supervisor's own termination auto-cascades to linked children
-  (emergent ripple, each records `PeerKilled`). No explicit stop-each-at-shutdown.
-- **C1 — one callback:** single `theater:simple/lifecycle.handle-lifecycle-event`
-  for all monitored actors (the supervisor-handlers duplicate is deleted).
-- **C2 — view-scope = library:** runtime stays flat; the library owns its
-  children-set + subtree view-scope in its in-module state.
+- **CARRIES (re-expressed):** crash→restart + rate-limit (now = reconcile on
+  `Failed`); the flight-recorder (now = the `record` arg); the RSM control-plane
+  (now = declarative roster mutation, v0.1); the external stall-probe design;
+  packr-guest 0.24 + in-module-state + `self.*`.
+- **DROPPED:** the TCP + bearer command surface; `subscribe-to-child` (→ lifecycle
+  monitors); the supervisor-handler exports; the `store` handler; the library idea.
 
-**The library's per-child composition:** on `spawn` → (a) atomic terminal
-death-monitor [→ restart policy, rate-limited, on `Failed` only], (b) optional
-subset-filtered chain-monitor [→ the black box], (c) a `stop-self` link [fate].
-All land on the one `handle-lifecycle-event`; the callback dispatches on the
-payload (`TerminationCause` present → restart path; else → record path). All
-policy in the library; zero lineage in the runtime.
+## 6. Primitive contract reference (theater-dev, PR #204 @ c3937bdc)
 
-## Migrating from sentinel — what carries, what's dropped
-
-- CARRIES (re-expressed on the new model): crash→restart w/ rate-limit; the
-  flight-recorder (chain capture + persist-at-death + get_chain); the RSM
-  control-plane (control-sm + mesh face); the external stall-probe design
-  (mesh-supervision-spec v3); packr-guest 0.24 + in-module-state + `self.*`.
-- DROPPED: the TCP+bearer command surface (D1); `subscribe-to-child` + the
-  subscribe opt-out (D2); the supervisor-handler exports trio → the single
-  `handle-lifecycle-event` on a monitor (D3).
+`runtime`: `spawn(manifest, init-state, wasm-bytes) -> result<string, runtime-error>`,
+`spawn-and-wait`, `stop-actor(id)`, `kill-actor(id)`, `list-actors`, `get-actor-*`.
+`runtime-error` / `spawn-failure` are richly typed. Restart = library-composed
+`stop + spawn` (no resume; state rebuilds by replay; address by stable handle, id
+rotates). `lifecycle`: `link`/`unlink`, `monitor`/`monitor-filtered(subject, filter)`
+(#205)/`unmonitor`, `subscribe-to-actor`, `subscribe-to-spawns`. Callback:
+`lifecycle-handlers.handle-lifecycle-event(subject, event-type, data)` — one export
+for all monitored actors; terminal = `event-type="terminated"` + `TerminationCause`.
