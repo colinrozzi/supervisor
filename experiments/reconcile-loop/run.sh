@@ -24,6 +24,7 @@ CARGO="${CARGO:-$(ls -d /nix/store/*-rust-default-*/bin/cargo 2>/dev/null \
   | while read -r c; do tc=$(dirname "$(dirname "$c")"); \
       [ -e "$tc/lib/rustlib/wasm32-unknown-unknown" ] && echo "$c" && break; done)}"
 [ -n "${CARGO:-}" ] || { echo "no rust toolchain with wasm32 target; set \$CARGO"; exit 1; }
+export PATH="$(dirname "$CARGO"):$PATH"   # so cargo finds rustc alongside it
 echo "cargo: $CARGO"
 
 # --- theater host ---

@@ -1,16 +1,19 @@
 # Experiment 1 — prove the reconcile loop
 
 **Status: GREEN (2026-09-11).** The first end-to-end proof that the supervisor's
-core loop works on post-#204 theater (rev `c3937bdc`).
+core loop works — re-verified on the post-#206 lifecycle reshape (theater rev
+`c197d707`: full-chain `monitor`, `monitor-filtered`, `handle-actor-event`).
+Originally proven on `c3937bdc`.
 
 ## What it proves
 
 A supervisor with a one-service roster reconciles reality to that roster through
 the full primitive path:
 
-1. **init** → `runtime.spawn` the child + `lifecycle.monitor` it.
-2. child self-terminates → the runtime emits the terminal `"terminated"` lifecycle
-   event → the monitor delivers it to `lifecycle-handlers.handle-lifecycle-event`.
+1. **init** → `runtime.spawn` the child + `lifecycle.monitor-filtered(id, terminations())`
+   it (woken only on the child's terminal event, not its whole chain).
+2. child self-terminates → the runtime emits the terminal `"terminated"` event →
+   the filtered monitor delivers it to `lifecycle-handlers.handle-actor-event`.
 3. the supervisor **reconciles**: desired-but-now-absent → respawn (rate-limited).
 4. after `max` (5) restarts inside `window_ms` (60s), the rate-limiter **trips** →
    the service is `BLOCKED`, no further respawn — and the supervisor itself stays up.
