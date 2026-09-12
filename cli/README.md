@@ -68,14 +68,19 @@ nix shell nixpkgs#gcc nixpkgs#pkg-config --command bash -c '
 `spawn … --control-port N` opens a JSON-over-TCP control surface on the supervisor.
 From another terminal, the control verbs are thin TCP clients to it:
 
+Port defaults to **9000** on both sides — bare `--control-port` opens 9000, and the
+client `--port` defaults to 9000 — so you can usually omit it:
+
 ```sh
-supervisor spawn roster.json --control-port 9000      # server (hosts + listens)
-supervisor list                          --port 9000   # the live roster (desired + status)
-supervisor status heartbeat              --port 9000
-supervisor add worker ./worker.toml      --port 9000 [--max 5 --window-ms 60000 --keep-chain]
-supervisor remove worker                 --port 9000   # supervisor stops it
-supervisor chain heartbeat               --port 9000   # in-memory chain (needs record or keep_chain)
+supervisor spawn roster.json --control-port     # server on 9000 (or --control-port N)
+supervisor list                                 # the live roster (desired + status)
+supervisor status heartbeat
+supervisor add worker ./worker.toml [--max 5 --window-ms 60000 --keep-chain]
+supervisor remove worker                        # supervisor stops it
+supervisor chain heartbeat                      # in-memory chain (needs record or keep_chain)
 ```
+
+(Omit `--control-port` entirely to leave the surface off. All verbs take `--port N`.)
 
 Each edit mutates the supervisor's *desired* roster and it reconciles: `add` spawns +
 monitors, `remove` stops. See `docs/control-surface.md`.

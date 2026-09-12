@@ -73,9 +73,10 @@ struct SpawnArgs {
     #[arg(long)]
     record_dir: Option<String>,
 
-    /// Open the control surface on this TCP port (roster mode) — enables live
-    /// `add`/`remove`/`list`/`status`/`chain` from another terminal.
-    #[arg(long)]
+    /// Open the control surface for live `add`/`remove`/`list`/`status`/`chain`
+    /// from another terminal. `--control-port` = 9000 (matches the client default),
+    /// `--control-port N` for another port. Omit entirely to leave the surface off.
+    #[arg(long, value_name = "PORT", num_args = 0..=1, default_missing_value = "9000")]
     control_port: Option<u16>,
 
     /// Print the actors' chain. Optional mode: `--chain` = pretty, `--chain compact`.
