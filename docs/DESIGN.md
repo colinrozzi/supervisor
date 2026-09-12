@@ -58,10 +58,12 @@ restart  : policy — strategy (on-failure | always | never) + rate-limit (max/w
 record?  : OPTIONAL — monitor this actor's chain, write its events to a sink
            (a file, or an http(s) endpoint). The flight-recorder / black box, opt-in.
            BUILT (experiments/record): a recording service is watched full-chain
-           (bare monitor); handle-actor-event POSTs every event to record.url via the
-           http-client handler. Sink is HTTP-only for now — theater has no filesystem
-           handler in the open registry yet (only an in-progress doc), so the `file`
-           sink waits on that; the `{url}` arg gains a `kind` when it lands.
+           (bare monitor); handle-actor-event writes every event to a sink. `record` is
+           a tagged union: {kind:"http",url} (POST via http-client — proven green) or
+           {kind:"file",path} (append via theater's filesystem handler #207). The file
+           sink is wired + builds but its E2E is blocked on a theater permission gap (a
+           `theater spawn` root's allowed_paths=["/"] can't resolve sandbox-relative;
+           reported to theater-dev). HTTP sink is the working default meanwhile.
 ```
 
 **State** (in a `#[derive(State)]` cell; a chain projection): `desired` (the

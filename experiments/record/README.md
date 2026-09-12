@@ -34,13 +34,22 @@ Decode it and you get the faithful event — the `terminated` one even carries
   `http-client.request` a POST to `record.url`. Recording is independent of the
   crash-catch: every event is recorded; only `terminated` drives the reconcile.
 
-## Sink: HTTP today, file later
+## Sinks: `http` (green) and `file` (wired, blocked on a theater gap)
 
-The v0 sink is **HTTP** because **theater has no `filesystem` handler in the open
-handler registry at `c197d707`** — only an in-progress doc
-(`crates/theater/changes/in-progress/docs/filesystem.rs.doc.md`). The manifest still
-carries a `FileSystemHandlerConfig`, but no crate implements `theater:simple/filesystem`.
-When it lands, a `file` sink slots in behind the same `record` arg (add a `kind`).
+`record` is a tagged union — `{"kind":"http","url":…}` or `{"kind":"file","path":…}`
+— backed by a `Sink` enum; `handle-actor-event` dispatches HTTP→POST, File→`append-file`.
+
+- **http** — proven green E2E (above). POST each event via the http-client handler.
+- **file** — wired against theater's filesystem handler (#207, rev `0b60fdb6`):
+  `Sink::File(path)` appends each JSON line via `filesystem.append-file`, sandboxed to
+  the handler's configured root. The code works (capability + path resolution both pass),
+  but the write is **currently blocked by a theater permission gap**: a `theater spawn`
+  root grants `file_system.allowed_paths = ["/"]`, and the handler resolves allowed-paths
+  *relative to the sandbox root* — which rejects the absolute `/`, so every write is
+  `permission-denied: … outside the allowed-paths`. `permission_policy` restrict can't fix
+  it (a relative child entry fails restrict's `starts_with("/")` superset check; restrict
+  can't widen to `None`). Reported to theater-dev; candidate fix is the handler mapping an
+  allowed-path `/` to the sandbox root. The file sink verifies the same day that lands.
 
 ## Run it
 

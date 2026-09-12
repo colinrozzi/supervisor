@@ -72,6 +72,15 @@ pack_types! {
         headers: list<http-header>,
         body: option<list<u8>>,
     }
+    variant filesystem-error {
+        not-found(string),
+        permission-denied(string),
+        already-exists(string),
+        not-a-directory(string),
+        is-a-directory(string),
+        invalid-path(string),
+        io-error(string),
+    }
     imports {
         theater:simple/self {
             log: func(msg: string),
@@ -85,6 +94,9 @@ pack_types! {
         }
         theater:simple/http-client {
             request: func(req: http-request) -> result<http-response, string>,
+        }
+        theater:simple/filesystem {
+            append-file: func(path: string, content: list<u8>) -> result<_, filesystem-error>,
         }
         theater:simple/timer {
             now: func() -> u64,
@@ -118,6 +130,25 @@ use theater_guest::filters::terminations;
 // the boundary as `Value` (a Value::Record), so import raw and hand-build the request.
 #[import(module = "theater:simple/http-client", name = "request")]
 fn http_request_raw(req: Value) -> Value;
+
+// filesystem.append-file(path, content) -> result<_, filesystem-error>. Append (create
+// if absent), sandboxed to the handler's configured root; the file-sink path is relative
+// to that root. Import raw + parse the result (Ok unit | Err filesystem-error).
+#[import(module = "theater:simple/filesystem", name = "append-file")]
+fn append_file_raw(path: String, content: Vec<u8>) -> Value;
+
+/// Append bytes to a sandboxed file; returns () or the filesystem-error case name.
+fn fs_append(path: &str, content: Vec<u8>) -> Result<(), String> {
+    match append_file_raw(String::from(path), content) {
+        Value::Result { value: Ok(_), .. } => Ok(()),
+        Value::Result { value: Err(e), .. } => Err(error_detail(*e)),
+        Value::Variant { tag: 0, .. } => Ok(()),
+        Value::Variant { tag: 1, payload, .. } => {
+            Err(payload.into_iter().next().map(error_detail).unwrap_or_else(|| String::from("unknown")))
+        }
+        _ => Err(String::from("filesystem: unexpected result")),
+    }
+}
 
 /// Lowercase hex of raw bytes (no_std, no dep) — how a chain event's `data` is carried
 /// in the recorded JSON so the sink gets a faithful, inspectable copy.
@@ -221,6 +252,18 @@ fn error_case(v: Value) -> String {
     }
 }
 
+/// Like `error_case` but includes the payload detail string, e.g. "permission-denied: <why>".
+fn error_detail(v: Value) -> String {
+    match v {
+        Value::Variant { case_name, payload, .. } => match payload.into_iter().next() {
+            Some(Value::String(s)) => format!("{}: {}", case_name, s),
+            _ => case_name,
+        },
+        Value::String(s) => s,
+        _ => String::from("unknown"),
+    }
+}
+
 fn runtime_spawn(manifest: &str) -> Result<String, String> {
     match runtime_spawn_raw(manifest.to_string(), None, None) {
         // packr-native result
@@ -256,14 +299,24 @@ struct ServiceCfg {
     max: Option<u32>,
     #[serde(default)]
     window_ms: Option<u64>,
-    /// Opt-in flight-recorder: monitor this service's FULL chain and POST every
-    /// event to `record.url`. (v0 sink = http; file arrives when the fs handler lands.)
+    /// Opt-in flight-recorder: watch this service's FULL chain and write every event
+    /// to a sink — `{"kind":"http","url":…}` (POST) or `{"kind":"file","path":…}` (append).
     #[serde(default)]
     record: Option<RecordCfg>,
 }
 #[derive(Deserialize)]
-struct RecordCfg {
-    url: String,
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum RecordCfg {
+    Http { url: String },
+    File { path: String },
+}
+impl RecordCfg {
+    fn into_sink(self) -> Sink {
+        match self {
+            RecordCfg::Http { url } => Sink::Http(url),
+            RecordCfg::File { path } => Sink::File(path),
+        }
+    }
 }
 
 // ---- state (in-module cell; a chain projection) ----------------------------
@@ -274,6 +327,12 @@ struct RecordCfg {
 struct SupervisorState {
     services: Vec<Svc>,
 }
+/// Where a recording service's chain events go.
+#[derive(Clone, GraphValue)]
+enum Sink {
+    Http(String), // POST each event to this URL (http-client)
+    File(String), // append each event to this sandboxed path (filesystem)
+}
 #[derive(Clone, GraphValue)]
 struct Svc {
     handle: String,
@@ -283,8 +342,8 @@ struct Svc {
     current_id: String,
     restarts: Vec<u64>,
     blocked: bool,
-    /// Flight-recorder sink URL (None = not recording) + a per-service event counter.
-    record_url: Option<String>,
+    /// Flight-recorder sink (None = not recording) + a per-service event counter.
+    record: Option<Sink>,
     rec_seq: u64,
 }
 
@@ -345,9 +404,9 @@ fn init(config: Value) -> Value {
 
     let mut services: Vec<Svc> = Vec::new();
     for s in cfg.services {
-        let record_url = s.record.map(|r| r.url);
+        let record = s.record.map(RecordCfg::into_sink);
         // initial reconcile: desired-absent -> spawn + watch.
-        let current_id = match spawn_and_watch(&s.handle, &s.manifest, record_url.is_some()) {
+        let current_id = match spawn_and_watch(&s.handle, &s.manifest, record.is_some()) {
             Ok(id) => id,
             Err(e) => {
                 // A hard spawn failure at init is fatal — the operator needs to know.
@@ -362,7 +421,7 @@ fn init(config: Value) -> Value {
             current_id,
             restarts: Vec::new(),
             blocked: false,
-            record_url,
+            record,
             rec_seq: 0,
         });
     }
@@ -389,28 +448,37 @@ fn handle_actor_event(input: Value) -> Value {
         _ => return ok_unit(),
     };
 
-    // Flight-recorder: a recording service watches its child's FULL chain, so POST
-    // every event to the sink. (A plain service is subscribed terminations-only and
-    // never reaches here for non-terminals.) Read url + bump seq under a short borrow,
-    // then POST outside it.
+    // Flight-recorder: a recording service watches its child's FULL chain, so write
+    // every event to its sink. (A plain service is subscribed terminations-only and
+    // never reaches here for non-terminals.) Clone the sink + bump seq under a short
+    // borrow, then do the host I/O outside it.
     let sink = SupervisorState::with_mut(|st| {
         st.services
             .iter_mut()
-            .find(|s| s.current_id == subject && s.record_url.is_some())
+            .find(|s| s.current_id == subject && s.record.is_some())
             .map(|s| {
                 let seq = s.rec_seq;
                 s.rec_seq += 1;
-                (s.record_url.clone().unwrap_or_default(), s.handle.clone(), seq)
+                (s.record.clone().unwrap(), s.handle.clone(), seq)
             })
     });
-    if let Some((url, handle, seq)) = sink {
-        let json = format!(
+    if let Some((sink, handle, seq)) = sink {
+        let line = format!(
             "{{\"handle\":\"{}\",\"child\":\"{}\",\"type\":\"{}\",\"seq\":{},\"data_hex\":\"{}\"}}",
             json_escape(&handle), json_escape(&subject), json_escape(&event_type), seq, hex(&data)
         );
-        match http_post_json(&url, json.into_bytes()) {
-            Ok(status) => log(format!("[supervisor] recorded {} seq={} type={} -> http {}", handle, seq, event_type, status)),
-            Err(e) => log(format!("[supervisor] record POST failed ({} seq={}): {}", handle, seq, e)),
+        let outcome = match &sink {
+            Sink::Http(url) => http_post_json(url, line.into_bytes()).map(|status| format!("http {}", status)),
+            Sink::File(path) => {
+                // one JSON object per line (JSONL) — append the line + newline.
+                let mut bytes = line.into_bytes();
+                bytes.push(b'\n');
+                fs_append(path, bytes).map(|_| format!("file {}", path))
+            }
+        };
+        match outcome {
+            Ok(where_) => log(format!("[supervisor] recorded {} seq={} type={} -> {}", handle, seq, event_type, where_)),
+            Err(e) => log(format!("[supervisor] record write failed ({} seq={}): {}", handle, seq, e)),
         }
     }
 
@@ -453,7 +521,7 @@ fn handle_actor_event(input: Value) -> Value {
         // Reconcile: desired-but-now-absent -> respawn (recording carries across incarnations).
         let handle = svc.handle.clone();
         let manifest = svc.manifest.clone();
-        let record = svc.record_url.is_some();
+        let record = svc.record.is_some();
         match spawn_and_watch(&handle, &manifest, record) {
             Ok(new_id) => {
                 let svc = &mut st.services[idx];

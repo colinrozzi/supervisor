@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 [dependencies]
 packr-guest = { version = "0.24", features = ["derive"] }
 packr-abi = { version = "0.24", default-features = false }
-theater-guest = { git = "https://github.com/colinrozzi/theater", rev = "c197d707f26ad0b135f1c629e6ac7c2870aa7206" }
+theater-guest = { git = "https://github.com/colinrozzi/theater", rev = "0b60fdb6a018c02c7af2e5b72481bc20956b26d5" }
 [profile.release]
 opt-level = "s"
 lto = true

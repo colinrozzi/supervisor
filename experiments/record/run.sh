@@ -51,7 +51,7 @@ cat > "$RUNDIR/supervisor-record.toml" <<EOF
 name = "supervisor"
 version = "0.0.1"
 package = "$SUP_WASM"
-initial_state = '{"services":[{"handle":"crasher","manifest":"$RUNDIR/crash-child.toml","max":2,"window_ms":60000,"record":{"url":"http://127.0.0.1:$PORT/"}}]}'
+initial_state = '{"services":[{"handle":"crasher","manifest":"$RUNDIR/crash-child.toml","max":2,"window_ms":60000,"record":{"kind":"http","url":"http://127.0.0.1:$PORT/"}}]}'
 
 [permission_policy.runtime]
 type = "restrict"
