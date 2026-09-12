@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# supervisor-upgrade — install/update the `supervisor` CLI from the latest GitHub
+# Release of colinrozzi/supervisor. Mirrors the fleet's inbox-upgrade / tickets-upgrade
+# / theater-upgrade wrappers: drop the binary on PATH, no container rebuild needed.
+#
+#   supervisor-upgrade            # install/update to the latest release
+#   supervisor-upgrade v0.1.0     # pin a specific tag
+set -euo pipefail
+
+REPO="colinrozzi/supervisor"
+TAG="${1:-latest}"
+BIN_DIR="${SUPERVISOR_BIN_DIR:-$HOME/.local/bin}"
+SHARE_DIR="${SUPERVISOR_SHARE_DIR:-$HOME/.local/share/supervisor}"
+mkdir -p "$BIN_DIR" "$SHARE_DIR"
+
+echo "supervisor-upgrade: fetching $REPO@$TAG …"
+
+# Prefer gh (agents are gh-authed); fall back to curl against the release API.
+if command -v gh >/dev/null 2>&1; then
+  args=(release download --repo "$REPO" --clobber --dir "$SHARE_DIR" --pattern 'supervisor' --pattern 'supervisor.wasm')
+  [ "$TAG" = "latest" ] || args+=("$TAG")
+  gh "${args[@]}"
+else
+  base="https://github.com/$REPO/releases"
+  url="$base/latest/download"
+  [ "$TAG" = "latest" ] || url="$base/download/$TAG"
+  curl -fSL "$url/supervisor"       -o "$SHARE_DIR/supervisor"
+  curl -fSL "$url/supervisor.wasm"  -o "$SHARE_DIR/supervisor.wasm" || true
+fi
+
+install -m 0755 "$SHARE_DIR/supervisor" "$BIN_DIR/supervisor"
+echo "supervisor-upgrade: installed -> $BIN_DIR/supervisor"
+"$BIN_DIR/supervisor" --version 2>/dev/null || "$BIN_DIR/supervisor" --help >/dev/null 2>&1 \
+  && echo "supervisor-upgrade: ok (the wasm is embedded; $SHARE_DIR/supervisor.wasm is a spare for --wasm)"

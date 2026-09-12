@@ -65,11 +65,20 @@ artifact needs a static (musl) build — see the distribution note below.
 
 ## Distribution (fleet use)
 
-Not yet published as a fleet tool. The gate is a **portable static binary**: the
-nix-toolchain build hard-codes `/nix/store` paths (glibc + ELF interpreter) that won't
-exist in another agent's container. That needs a musl rust toolchain (not in the image),
-so publishing — a static build + a release + a `supervisor-upgrade` wrapper matching the
-`inbox`/`tickets`/`theater-upgrade` pattern — is coordinated with the manager.
+Releases ship a **portable static-musl binary** with `supervisor.wasm` embedded — one
+self-contained file that runs in any agent container (no `/nix/store` deps). Built in CI
+(`.github/workflows/release.yml`) on a version tag, attached to the GitHub Release.
+
+Install / update on any agent via the `dist/supervisor-upgrade` wrapper (mirrors
+`inbox-upgrade` / `tickets-upgrade` / `theater-upgrade`):
+
+```sh
+supervisor-upgrade            # latest release → ~/.local/bin/supervisor
+supervisor-upgrade v0.1.0     # pin a tag
+```
+
+The binary embeds the wasm, so `--wasm` is optional (override for a dev rebuild). To cut
+a release: `git tag v0.1.0 && git push --tags`.
 
 ## Control surface (live roster mutation)
 

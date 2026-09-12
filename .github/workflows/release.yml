@@ -1,0 +1,54 @@
+name: release
+
+# Tag a version (e.g. `git tag v0.1.0 && git push --tags`) to build a portable,
+# static-musl `supervisor` binary (wasm embedded) + the standalone supervisor.wasm,
+# and attach them to the GitHub Release as downloadable assets.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (musl + wasm targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl, wasm32-unknown-unknown
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build supervisor.wasm (the reconciler actor)
+        run: cargo build -p supervisor --release --target wasm32-unknown-unknown
+
+      - name: Build the CLI (static musl, wasm embedded)
+        working-directory: cli
+        env:
+          # ring / any -sys crate needs the musl cross-cc for this target.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          SUPERVISOR_WASM: ${{ github.workspace }}/target/wasm32-unknown-unknown/release/supervisor.wasm
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Stage assets
+        run: |
+          mkdir -p dist
+          cp cli/target/x86_64-unknown-linux-musl/release/supervisor dist/supervisor
+          cp target/wasm32-unknown-unknown/release/supervisor.wasm dist/supervisor.wasm
+          ( cd dist && sha256sum supervisor supervisor.wasm > SHA256SUMS )
+
+      - name: Attach to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/supervisor
+            dist/supervisor.wasm
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true

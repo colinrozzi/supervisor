@@ -23,6 +23,10 @@ use theater::theater_runtime::TheaterRuntime;
 use theater::utils::{resolve_reference, ResourceCache};
 use theater::{ManifestConfig, TheaterId};
 
+/// supervisor.wasm embedded at build time (see build.rs). Empty if none was available
+/// at build — then `--wasm` is required at runtime.
+static EMBEDDED_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/supervisor.wasm"));
+
 #[derive(Parser)]
 #[command(name = "supervisor", about = "Dev CLI for the supervisor reconciler")]
 struct Cli {
@@ -68,9 +72,10 @@ struct SpawnArgs {
     #[arg(long, conflicts_with = "roster")]
     manifest: Option<String>,
 
-    /// Path to the built supervisor.wasm (roster mode).
-    #[arg(long, default_value = "target/wasm32-unknown-unknown/release/supervisor.wasm")]
-    wasm: String,
+    /// Path to the supervisor.wasm (roster mode). Defaults to the wasm embedded in
+    /// this binary at build time; pass this to override (e.g. a dev rebuild).
+    #[arg(long)]
+    wasm: Option<String>,
 
     /// Sandbox root for `file` record sinks (roster mode).
     #[arg(long)]
@@ -230,7 +235,7 @@ fn load_manifest(args: &SpawnArgs) -> Result<(ManifestConfig, std::path::PathBuf
             .ok_or_else(|| anyhow!("give a roster file, or --manifest <path>"))?;
         let roster = std::fs::read_to_string(roster_path)
             .with_context(|| format!("reading roster {roster_path}"))?;
-        let toml = generate_manifest(&roster, &args.wasm, args.record_dir.as_deref(), args.control_port)?;
+        let toml = generate_manifest(&roster, args.wasm.as_deref(), args.record_dir.as_deref(), args.control_port)?;
         if args.show_manifest {
             eprintln!("--- generated manifest ---\n{toml}\n--------------------------");
         }
@@ -243,7 +248,7 @@ fn load_manifest(args: &SpawnArgs) -> Result<(ManifestConfig, std::path::PathBuf
 /// Build a supervisor manifest TOML around a roster: package = supervisor.wasm,
 /// initial_state = the (compacted) roster, and the handlers + permission grants the
 /// supervisor needs — http-client / filesystem only when a service records to them.
-fn generate_manifest(roster: &str, wasm: &str, record_dir: Option<&str>, control_port: Option<u16>) -> Result<String> {
+fn generate_manifest(roster: &str, wasm: Option<&str>, record_dir: Option<&str>, control_port: Option<u16>) -> Result<String> {
     let mut parsed: serde_json::Value =
         serde_json::from_str(roster).context("roster is not valid JSON")?;
     // Inject the control port into the roster's init config (opt-in).
@@ -272,8 +277,15 @@ fn generate_manifest(roster: &str, wasm: &str, record_dir: Option<&str>, control
         }
     }
 
-    let wasm_abs = std::fs::canonicalize(wasm)
-        .with_context(|| format!("supervisor wasm not found at {wasm} (build it, or pass --wasm)"))?;
+    // package path: canonicalized --wasm if given, else a marker (the embedded wasm
+    // bytes are passed to spawn directly, so this field isn't used to load the wasm).
+    let package = match wasm {
+        Some(w) => std::fs::canonicalize(w)
+            .with_context(|| format!("supervisor wasm not found at {w}"))?
+            .display()
+            .to_string(),
+        None => "supervisor.wasm".to_string(),
+    };
 
     // Compact one-line JSON → TOML literal string (single quotes; double-quotes need no escape).
     let init_state = serde_json::to_string(&parsed).context("re-serializing roster")?;
@@ -284,7 +296,7 @@ fn generate_manifest(roster: &str, wasm: &str, record_dir: Option<&str>, control
     let mut m = String::new();
     m.push_str("name = \"supervisor\"\n");
     m.push_str("version = \"0.0.1\"\n");
-    m.push_str(&format!("package = \"{}\"\n", wasm_abs.display()));
+    m.push_str(&format!("package = \"{}\"\n", package));
     m.push_str(&format!("initial_state = '{init_state}'\n\n"));
 
     m.push_str("[permission_policy.runtime]\n");
@@ -365,15 +377,24 @@ async fn spawn(args: &SpawnArgs) -> Result<()> {
         }
     });
 
-    // --- resolve + load wasm, then spawn (setup + auto-init) ---
-    let wasm_path = if manifest.package.starts_with('/') || manifest.package.contains("://") {
-        manifest.package.clone()
+    // --- load the wasm bytes ---
+    // roster mode with no --wasm → the wasm embedded at build time. Otherwise resolve
+    // from the manifest's package path (raw --manifest, or an explicit --wasm).
+    let wasm_bytes = if args.manifest.is_none() && args.wasm.is_none() {
+        if EMBEDDED_WASM.is_empty() {
+            return Err(anyhow!("this build has no embedded supervisor.wasm — pass --wasm <path>"));
+        }
+        EMBEDDED_WASM.to_vec()
     } else {
-        manifest_dir.join(&manifest.package).to_string_lossy().to_string()
+        let wasm_path = if manifest.package.starts_with('/') || manifest.package.contains("://") {
+            manifest.package.clone()
+        } else {
+            manifest_dir.join(&manifest.package).to_string_lossy().to_string()
+        };
+        resolve_reference(&wasm_path)
+            .await
+            .map_err(|e| anyhow!("loading wasm from {wasm_path}: {e}"))?
     };
-    let wasm_bytes = resolve_reference(&wasm_path)
-        .await
-        .map_err(|e| anyhow!("loading wasm from {wasm_path}: {e}"))?;
 
     let init_state = match manifest.initial_state.as_ref() {
         Some(s) => Value::String(s.clone()),
