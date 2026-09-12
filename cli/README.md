@@ -52,16 +52,24 @@ Exits when the root actor terminates, or on Ctrl+C.
 
 ## Build
 
-Native build; the theater host pulls `openssl-sys` (via reqwest). With nix:
+Native build. As of theater #209 (rustls, no openssl) the recipe is just:
 
 ```sh
-OSSL_DEV=$(nix build nixpkgs#openssl.dev --no-link --print-out-paths)
-OSSL_OUT=$(nix build nixpkgs#openssl.out --no-link --print-out-paths)
-nix shell nixpkgs#gcc nixpkgs#pkg-config --command bash -c '
-  export CC=gcc OPENSSL_LIB_DIR=$OSSL_OUT/lib OPENSSL_INCLUDE_DIR=$OSSL_DEV/include OPENSSL_NO_VENDOR=1
-  cargo build --release'
+nix shell nixpkgs#gcc --command bash -c 'CC=gcc cargo build --release'
 # → target/release/supervisor
 ```
+
+Note: a binary built with the nix toolchain links its glibc/interpreter from
+`/nix/store`, so it is **not portable** to another container as-is. A fleet-portable
+artifact needs a static (musl) build — see the distribution note below.
+
+## Distribution (fleet use)
+
+Not yet published as a fleet tool. The gate is a **portable static binary**: the
+nix-toolchain build hard-codes `/nix/store` paths (glibc + ELF interpreter) that won't
+exist in another agent's container. That needs a musl rust toolchain (not in the image),
+so publishing — a static build + a release + a `supervisor-upgrade` wrapper matching the
+`inbox`/`tickets`/`theater-upgrade` pattern — is coordinated with the manager.
 
 ## Control surface (live roster mutation)
 
