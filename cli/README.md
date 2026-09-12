@@ -30,9 +30,9 @@ supervisor spawn roster.json --wasm … --show-manifest
   `pretty` (default) decodes it: `» <log message>`, `→ <iface>/<fn>(<args>)`,
   `⚙ call|result <fn>`, `● spawned`, `✖ terminated (<cause>)`. `compact` is a terse
   type-only skim. Bare `--chain` = pretty.
-- **`--logs`** — theater's **runtime logs** (the host's internals: manifest parse,
-  permission calc, scheduling, errors). Level via `RUST_LOG` (e.g. `RUST_LOG=theater=debug`),
-  else `info`. Off by default.
+- **`--logs [error|warn|info|debug|trace]`** — theater's **runtime logs** (the host's
+  internals: manifest parse, permission calc, scheduling, errors). Bare `--logs` = `info`;
+  off by default. `RUST_LOG` overrides (for per-crate directives, e.g. `RUST_LOG=theater=debug`).
 
 The two compose. With neither flag, the default is `--chain pretty`; `--logs` alone
 gives logs-only (chain off). Actor `self.log` output lives in the chain (rendered as

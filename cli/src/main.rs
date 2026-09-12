@@ -60,10 +60,11 @@ struct SpawnArgs {
     #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "pretty")]
     chain: Option<ChainMode>,
 
-    /// Print theater's runtime logs (the host's internals). Level via RUST_LOG,
-    /// else `info`. Off by default.
-    #[arg(long)]
-    logs: bool,
+    /// Print theater's runtime logs (the host's internals) at this level:
+    /// `--logs` = info, or `--logs error|warn|info|debug|trace`. Off by default.
+    /// `RUST_LOG`, if set, overrides this (for per-crate directives).
+    #[arg(long, value_name = "LEVEL", num_args = 0..=1, default_missing_value = "info")]
+    logs: Option<LogLevel>,
 
     /// Print the generated manifest to stderr before spawning (roster mode).
     #[arg(long)]
@@ -78,15 +79,35 @@ enum ChainMode {
     Pretty,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+impl LogLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
     let Cmd::Spawn(args) = &cli.cmd;
 
-    // Runtime logs (theater's tracing): honor RUST_LOG, else `info` with --logs, else off.
-    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| {
-        if args.logs { "info".into() } else { "off".into() }
-    });
+    // Runtime logs (theater's tracing): RUST_LOG wins (per-crate directives); else the
+    // --logs level; else off.
+    let filter = std::env::var("RUST_LOG")
+        .unwrap_or_else(|_| args.logs.map(|l| l.as_str().to_string()).unwrap_or_else(|| "off".into()));
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .with_writer(std::io::stderr)
@@ -206,7 +227,7 @@ async fn spawn(cmd: &Cmd) -> Result<()> {
     let Cmd::Spawn(args) = cmd;
 
     // Default: bare command streams the pretty chain; --logs alone means logs-only.
-    let chain_mode = match (args.chain, args.logs) {
+    let chain_mode = match (args.chain, args.logs.is_some()) {
         (Some(m), _) => Some(m),
         (None, true) => None,
         (None, false) => Some(ChainMode::Pretty),
