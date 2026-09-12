@@ -45,9 +45,16 @@ record sink). Per-entry: `{ handle, manifest (fs or http ref), restart?, record?
   Nudged by `handle-actor-event`. (Gating respawn on `Failed` only is pending a theater
   panic-trap fix; see `experiments/reconcile-loop`.)
 - **`record`** (opt-in per service, **built** — `experiments/record`): watch that actor's
-  **full chain** and POST every event to a sink URL via the http-client handler — the
-  flight-recorder / black box, as a roster arg. (Sink is HTTP today; a `file` sink lands
-  when theater ports the filesystem handler.)
+  **full chain** and write every event to a sink — the flight-recorder / black box, as a
+  roster arg. Tagged union `{kind:"http",url}` (POST via http-client) or
+  `{kind:"file",path}` (append via the filesystem handler); both green.
+
+## Dev CLI (`cli/`)
+
+`supervisor spawn <roster.json> --wasm <supervisor.wasm>` runs a roster on an in-process
+theater runtime and streams the decoded chain to stdout — it generates the manifest
+(handlers + permission grants) for you. See `cli/README.md`. The dev loop without
+hand-writing manifests or remembering `theater spawn` flags.
 
 Everything past v0 — live roster mutation over the network, git-served rosters,
 deploy/hot-swap, the external stall-probe, off-box notify — is "another way to

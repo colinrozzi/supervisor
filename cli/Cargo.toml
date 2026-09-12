@@ -1,0 +1,23 @@
+[package]
+name = "supervisor-cli"
+version = "0.0.1"
+edition = "2021"
+description = "Dev CLI for the supervisor reconciler: spawn a roster on an in-process theater runtime and stream its decoded chain to stdout."
+
+# Standalone crate (NOT a member of the wasm-guest workspace): this is a native
+# binary linking theater-as-a-library, a separate dependency tree from supervisor/.
+[workspace]
+
+[[bin]]
+name = "supervisor"
+path = "src/main.rs"
+
+[dependencies]
+theater = { git = "https://github.com/colinrozzi/theater", rev = "4e4e67d3da0b3076f12c8f52b096ae63b8c47b4d" }
+theater-stage = { git = "https://github.com/colinrozzi/theater", rev = "4e4e67d3da0b3076f12c8f52b096ae63b8c47b4d" }
+theater-native = { git = "https://github.com/colinrozzi/theater", rev = "4e4e67d3da0b3076f12c8f52b096ae63b8c47b4d" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde_json = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
