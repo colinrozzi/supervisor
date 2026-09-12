@@ -1,9 +1,17 @@
 # Control surface (v0.1) — live roster mutation
 
-Status: DESIGN (2026-09-12). The v0.1 step after the green v0 (reconcile loop +
-record). Deliberately boring: **JSON over TCP, server in the supervisor actor, a
-thin native client in the CLI.** No HTTP (theater has no http-*server* handler yet),
-no same-actor client, no auth.
+Status: **BUILT + proven E2E (2026-09-12)** on theater `4e4e67d3`. Deliberately boring:
+**JSON over TCP, server in the supervisor actor, a thin native client in the CLI.**
+No HTTP (theater has no http-*server* handler yet), no same-actor client, no auth.
+
+Verified: `list`/`status`/`add`/`remove`/`chain` against a running supervisor — `add`
+reconciles a spawn (new `current_id`), `remove` reconciles a `stop-actor` (child
+`terminated (Stopped)`, dropped from the roster), `chain` returns the in-memory buffer.
+
+Plus a **`chain <handle>`** op (Colin's add): returns a service's in-memory ring of
+recent chain events (`{seq, type, data_hex}`). Populated when a service is watched
+full-chain — i.e. it `record`s, or sets `keep_chain: true` (a per-service opt-in that
+keeps the chain queryable without a sink). Capped at `CHAIN_BUF_MAX` (200).
 
 ## 1. Principle — edit desired, reconcile
 

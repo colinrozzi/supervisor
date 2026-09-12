@@ -63,7 +63,19 @@ nix shell nixpkgs#gcc nixpkgs#pkg-config --command bash -c '
 # → target/release/supervisor
 ```
 
-## Next subcommands (not built yet)
+## Control surface (live roster mutation)
 
-- `up` — launcher (spawn + detach / manage).
-- `add` / `remove` / `list` — live roster mutation over a control surface (v0.1).
+`spawn … --control-port N` opens a JSON-over-TCP control surface on the supervisor.
+From another terminal, the control verbs are thin TCP clients to it:
+
+```sh
+supervisor spawn roster.json --control-port 9000      # server (hosts + listens)
+supervisor list                          --port 9000   # the live roster (desired + status)
+supervisor status heartbeat              --port 9000
+supervisor add worker ./worker.toml      --port 9000 [--max 5 --window-ms 60000 --keep-chain]
+supervisor remove worker                 --port 9000   # supervisor stops it
+supervisor chain heartbeat               --port 9000   # in-memory chain (needs record or keep_chain)
+```
+
+Each edit mutates the supervisor's *desired* roster and it reconciles: `add` spawns +
+monitors, `remove` stops. See `docs/control-surface.md`.

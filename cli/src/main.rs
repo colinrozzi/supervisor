@@ -35,6 +35,24 @@ enum Cmd {
     /// Spawn a roster (or a raw manifest) on an in-process theater runtime and
     /// print its chain and/or the runtime's logs.
     Spawn(SpawnArgs),
+    /// List the roster of a running supervisor (via its control port).
+    List { #[arg(long, default_value = "9000")] port: u16 },
+    /// Show one service's spec + status.
+    Status { handle: String, #[arg(long, default_value = "9000")] port: u16 },
+    /// Add a service to a running supervisor's desired roster (it reconciles).
+    Add {
+        handle: String,
+        manifest: String,
+        #[arg(long, default_value = "9000")] port: u16,
+        #[arg(long)] max: Option<u32>,
+        #[arg(long)] window_ms: Option<u64>,
+        /// Keep the child's chain in memory (queryable with `chain`).
+        #[arg(long)] keep_chain: bool,
+    },
+    /// Remove a service (the supervisor stops it).
+    Remove { handle: String, #[arg(long, default_value = "9000")] port: u16 },
+    /// Dump a service's in-memory chain (needs record or keep_chain).
+    Chain { handle: String, #[arg(long, default_value = "9000")] port: u16 },
 }
 
 #[derive(Parser)]
@@ -54,6 +72,11 @@ struct SpawnArgs {
     /// Sandbox root for `file` record sinks (roster mode).
     #[arg(long)]
     record_dir: Option<String>,
+
+    /// Open the control surface on this TCP port (roster mode) — enables live
+    /// `add`/`remove`/`list`/`status`/`chain` from another terminal.
+    #[arg(long)]
+    control_port: Option<u16>,
 
     /// Print the actors' chain. Optional mode: `--chain` = pretty, `--chain compact`.
     /// Default when neither --chain nor --logs is given: `--chain pretty`.
@@ -102,21 +125,70 @@ impl LogLevel {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let Cmd::Spawn(args) = &cli.cmd;
-
-    // Runtime logs (theater's tracing): RUST_LOG wins (per-crate directives); else the
-    // --logs level; else off.
-    let filter = std::env::var("RUST_LOG")
-        .unwrap_or_else(|_| args.logs.map(|l| l.as_str().to_string()).unwrap_or_else(|| "off".into()));
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-        .with_writer(std::io::stderr)
-        .init();
-
-    if let Err(e) = spawn(&cli.cmd).await {
+    let res = match &cli.cmd {
+        Cmd::Spawn(args) => {
+            // Runtime logs (theater's tracing): RUST_LOG wins; else the --logs level; else off.
+            let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| {
+                args.logs.map(|l| l.as_str().to_string()).unwrap_or_else(|| "off".into())
+            });
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+                .with_writer(std::io::stderr)
+                .init();
+            spawn(args).await
+        }
+        Cmd::List { port } => control_print(*port, &json_op("list", &[])),
+        Cmd::Status { handle, port } => control_print(*port, &json_op("status", &[("handle", handle)])),
+        Cmd::Remove { handle, port } => control_print(*port, &json_op("remove", &[("handle", handle)])),
+        Cmd::Chain { handle, port } => control_print(*port, &json_op("chain", &[("handle", handle)])),
+        Cmd::Add { handle, manifest, port, max, window_ms, keep_chain } => {
+            control_print(*port, &add_op(handle, manifest, *max, *window_ms, *keep_chain))
+        }
+    };
+    if let Err(e) = res {
         eprintln!("supervisor: {e:#}");
         std::process::exit(1);
     }
+}
+
+/// Send one JSON op to a running supervisor's control port and print the reply.
+fn control_print(port: u16, op_json: &str) -> Result<()> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
+        .with_context(|| format!("connecting to supervisor control port {port}"))?;
+    stream.write_all(op_json.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp)?; // server replies then closes
+    println!("{}", String::from_utf8_lossy(&resp).trim());
+    Ok(())
+}
+
+/// Build a flat `{"op":…, k:v,…}` request (string values).
+fn json_op(op: &str, fields: &[(&str, &str)]) -> String {
+    let mut s = format!("{{\"op\":\"{}\"", op);
+    for (k, v) in fields {
+        s.push_str(&format!(",\"{}\":\"{}\"", k, json_escape(v)));
+    }
+    s.push('}');
+    s
+}
+
+/// Build an `add` request with a nested service object.
+fn add_op(handle: &str, manifest: &str, max: Option<u32>, window_ms: Option<u64>, keep_chain: bool) -> String {
+    let mut svc = format!("{{\"handle\":\"{}\",\"manifest\":\"{}\"", json_escape(handle), json_escape(manifest));
+    if let Some(m) = max {
+        svc.push_str(&format!(",\"max\":{}", m));
+    }
+    if let Some(w) = window_ms {
+        svc.push_str(&format!(",\"window_ms\":{}", w));
+    }
+    if keep_chain {
+        svc.push_str(",\"keep_chain\":true");
+    }
+    svc.push('}');
+    format!("{{\"op\":\"add\",\"service\":{}}}", svc)
 }
 
 fn load_manifest(args: &SpawnArgs) -> Result<(ManifestConfig, std::path::PathBuf)> {
@@ -137,7 +209,7 @@ fn load_manifest(args: &SpawnArgs) -> Result<(ManifestConfig, std::path::PathBuf
             .ok_or_else(|| anyhow!("give a roster file, or --manifest <path>"))?;
         let roster = std::fs::read_to_string(roster_path)
             .with_context(|| format!("reading roster {roster_path}"))?;
-        let toml = generate_manifest(&roster, &args.wasm, args.record_dir.as_deref())?;
+        let toml = generate_manifest(&roster, &args.wasm, args.record_dir.as_deref(), args.control_port)?;
         if args.show_manifest {
             eprintln!("--- generated manifest ---\n{toml}\n--------------------------");
         }
@@ -150,9 +222,15 @@ fn load_manifest(args: &SpawnArgs) -> Result<(ManifestConfig, std::path::PathBuf
 /// Build a supervisor manifest TOML around a roster: package = supervisor.wasm,
 /// initial_state = the (compacted) roster, and the handlers + permission grants the
 /// supervisor needs — http-client / filesystem only when a service records to them.
-fn generate_manifest(roster: &str, wasm: &str, record_dir: Option<&str>) -> Result<String> {
-    let parsed: serde_json::Value =
+fn generate_manifest(roster: &str, wasm: &str, record_dir: Option<&str>, control_port: Option<u16>) -> Result<String> {
+    let mut parsed: serde_json::Value =
         serde_json::from_str(roster).context("roster is not valid JSON")?;
+    // Inject the control port into the roster's init config (opt-in).
+    if let Some(p) = control_port {
+        if let Some(obj) = parsed.as_object_mut() {
+            obj.insert("control".into(), serde_json::json!({ "port": p }));
+        }
+    }
     let mut http_hosts: Vec<String> = Vec::new();
     let mut needs_file = false;
     if let Some(services) = parsed.get("services").and_then(|s| s.as_array()) {
@@ -201,6 +279,9 @@ fn generate_manifest(roster: &str, wasm: &str, record_dir: Option<&str>) -> Resu
     for h in ["self", "runtime", "lifecycle", "timer"] {
         m.push_str(&format!("[[handler]]\ntype = \"{h}\"\n\n"));
     }
+    if control_port.is_some() {
+        m.push_str("[[handler]]\ntype = \"tcp\"\n\n");
+    }
     if !http_hosts.is_empty() {
         let hosts = http_hosts.iter().map(|h| format!("\"{h}\"")).collect::<Vec<_>>().join(", ");
         m.push_str(&format!("[[handler]]\ntype = \"http-client\"\nallowed_hosts = [{hosts}]\n\n"));
@@ -223,9 +304,7 @@ fn url_host(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
-async fn spawn(cmd: &Cmd) -> Result<()> {
-    let Cmd::Spawn(args) = cmd;
-
+async fn spawn(args: &SpawnArgs) -> Result<()> {
     // Default: bare command streams the pretty chain; --logs alone means logs-only.
     let chain_mode = match (args.chain, args.logs.is_some()) {
         (Some(m), _) => Some(m),
@@ -426,4 +505,21 @@ fn truncate(s: String, n: usize) -> String {
 
 fn short_iface(i: &str) -> String {
     i.strip_prefix("theater:simple/").unwrap_or(i).to_string()
+}
+
+/// Minimal JSON string escaping for the request fields the client builds.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
