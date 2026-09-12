@@ -47,8 +47,10 @@ jobs:
       - name: Assert the binary is truly static (portability guarantee)
         run: |
           file dist/supervisor
-          file dist/supervisor | grep -q "statically linked" \
-            || { echo "::error::supervisor is not statically linked — would not exec in other containers"; exit 1; }
+          # musl static builds are static-PIE ("static-pie linked"); a dynamic binary
+          # would say "dynamically linked". Match "static" to accept both static forms.
+          file dist/supervisor | grep -q "static" \
+            || { echo "::error::supervisor is not static — would not exec in other containers"; exit 1; }
 
       - name: Attach to the GitHub Release
         uses: softprops/action-gh-release@v2
