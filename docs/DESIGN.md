@@ -79,7 +79,8 @@ change — v0.1.)
 
 - **Live roster mutation over the network** (v0.1) — networked clients add/remove
   services. This is the RSM control-plane (`control-sm`) **reframed declaratively**:
-  clients author desired-state edits; the supervisor reconciles.
+  clients author desired-state edits; the supervisor reconciles. **Specced** in
+  `docs/control-surface.md` — JSON over TCP, server in the actor, thin native CLI client.
 - **Git-served / filesystem rosters** — the GitOps feed.
 - **Deploy / hot-swap** — edit a manifest → reconcile (stop-old/spawn-new); a
   dedicated atomic `update-package` (drain + chain-continuity) if zero-downtime is
