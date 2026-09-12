@@ -2,10 +2,10 @@
 //!
 //! `supervisor spawn <roster.json>` generates the supervisor manifest from a roster
 //! (baking in the handlers + permission grants), spawns it on an in-process theater
-//! runtime, and streams the decoded chain to stdout. `--manifest <m.toml>` spawns a
-//! ready manifest raw instead. This is the dev loop: edit the roster, `supervisor
-//! spawn`, watch the whole supervised tree's chain live — no `theater` binary, no
-//! hand-written manifest boilerplate.
+//! runtime, and prints two independently-toggled streams:
+//!   --chain [compact|pretty]  the actors' chain (the record of every event)
+//!   --logs                    theater's own runtime logs (the host's internals)
+//! `--manifest <m.toml>` spawns a ready manifest raw instead.
 
 use std::sync::Arc;
 
@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 
 use theater::chain::ChainEvent;
 use theater::events::lifecycle::{ActorLifecycleEvent, TerminationCause};
+use theater::events::wasm::WasmEventData;
 use theater::events::{decode_chain_event_payload, ChainEventPayload};
 use theater::messages::{default_init_state, TheaterCommand};
 use theater::pack_bridge::Value;
@@ -32,7 +33,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Spawn a roster (or a raw manifest) on an in-process theater runtime and
-    /// stream its decoded chain to stdout.
+    /// print its chain and/or the runtime's logs.
     Spawn(SpawnArgs),
 }
 
@@ -50,54 +51,57 @@ struct SpawnArgs {
     #[arg(long, default_value = "target/wasm32-unknown-unknown/release/supervisor.wasm")]
     wasm: String,
 
-    /// Sandbox root for `file` record sinks (roster mode). Required if any
-    /// service records to a file.
+    /// Sandbox root for `file` record sinks (roster mode).
     #[arg(long)]
     record_dir: Option<String>,
 
-    /// How to render chain events.
-    #[arg(long, value_enum, default_value = "pretty")]
-    format: Format,
+    /// Print the actors' chain. Optional mode: `--chain` = pretty, `--chain compact`.
+    /// Default when neither --chain nor --logs is given: `--chain pretty`.
+    #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "pretty")]
+    chain: Option<ChainMode>,
+
+    /// Print theater's runtime logs (the host's internals). Level via RUST_LOG,
+    /// else `info`. Off by default.
+    #[arg(long)]
+    logs: bool,
 
     /// Print the generated manifest to stderr before spawning (roster mode).
     #[arg(long)]
     show_manifest: bool,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum Format {
-    /// One decoded, human-readable line per event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ChainMode {
+    /// One terse line per event (type only) — a skim.
+    Compact,
+    /// Decoded, with messages + call args.
     Pretty,
-    /// theater's raw short format.
-    Short,
 }
 
 #[tokio::main]
 async fn main() {
+    let cli = Cli::parse();
+    let Cmd::Spawn(args) = &cli.cmd;
+
+    // Runtime logs (theater's tracing): honor RUST_LOG, else `info` with --logs, else off.
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| {
+        if args.logs { "info".into() } else { "off".into() }
+    });
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
-    let res = match cli.cmd {
-        Cmd::Spawn(args) => spawn(args).await,
-    };
-    if let Err(e) = res {
+    if let Err(e) = spawn(&cli.cmd).await {
         eprintln!("supervisor: {e:#}");
         std::process::exit(1);
     }
 }
 
-/// Resolve the manifest to spawn: a raw `--manifest`, or one generated from a roster.
-/// Returns the parsed manifest and the directory its `package` path resolves against.
 fn load_manifest(args: &SpawnArgs) -> Result<(ManifestConfig, std::path::PathBuf)> {
     if let Some(path) = &args.manifest {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("reading manifest {path}"))?;
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("reading manifest {path}"))?;
         let manifest = ManifestConfig::from_toml_str(&content)
             .map_err(|e| anyhow!("parsing manifest {path}: {e}"))?;
         let dir = std::path::Path::new(path)
@@ -123,10 +127,9 @@ fn load_manifest(args: &SpawnArgs) -> Result<(ManifestConfig, std::path::PathBuf
 }
 
 /// Build a supervisor manifest TOML around a roster: package = supervisor.wasm,
-/// initial_state = the roster JSON, and the handlers + permission grants the
+/// initial_state = the (compacted) roster, and the handlers + permission grants the
 /// supervisor needs — http-client / filesystem only when a service records to them.
 fn generate_manifest(roster: &str, wasm: &str, record_dir: Option<&str>) -> Result<String> {
-    // Validate the roster is JSON and discover which record sinks are in play.
     let parsed: serde_json::Value =
         serde_json::from_str(roster).context("roster is not valid JSON")?;
     let mut http_hosts: Vec<String> = Vec::new();
@@ -136,11 +139,9 @@ fn generate_manifest(roster: &str, wasm: &str, record_dir: Option<&str>) -> Resu
             if let Some(rec) = svc.get("record") {
                 match rec.get("kind").and_then(|k| k.as_str()) {
                     Some("http") => {
-                        if let Some(url) = rec.get("url").and_then(|u| u.as_str()) {
-                            if let Some(h) = url_host(url) {
-                                if !http_hosts.contains(&h) {
-                                    http_hosts.push(h);
-                                }
+                        if let Some(h) = rec.get("url").and_then(|u| u.as_str()).and_then(url_host) {
+                            if !http_hosts.contains(&h) {
+                                http_hosts.push(h);
                             }
                         }
                     }
@@ -154,13 +155,11 @@ fn generate_manifest(roster: &str, wasm: &str, record_dir: Option<&str>) -> Resu
     let wasm_abs = std::fs::canonicalize(wasm)
         .with_context(|| format!("supervisor wasm not found at {wasm} (build it, or pass --wasm)"))?;
 
-    // The roster JSON goes in verbatim as initial_state; single-quote it (TOML
-    // literal string) so its double-quotes don't need escaping. Reject the rare
-    // roster that contains a single quote rather than mangle it.
-    if roster.contains('\'') {
-        return Err(anyhow!("roster contains a single quote; not supported yet"));
+    // Compact one-line JSON → TOML literal string (single quotes; double-quotes need no escape).
+    let init_state = serde_json::to_string(&parsed).context("re-serializing roster")?;
+    if init_state.contains('\'') {
+        return Err(anyhow!("roster contains a single quote in a value; not supported yet"));
     }
-    let init_state = roster.trim();
 
     let mut m = String::new();
     m.push_str("name = \"supervisor\"\n");
@@ -168,13 +167,11 @@ fn generate_manifest(roster: &str, wasm: &str, record_dir: Option<&str>) -> Resu
     m.push_str(&format!("package = \"{}\"\n", wasm_abs.display()));
     m.push_str(&format!("initial_state = '{init_state}'\n\n"));
 
-    // runtime CONTROL cap defaults to Disallow — must be granted to spawn/monitor.
     m.push_str("[permission_policy.runtime]\n");
     m.push_str("type = \"restrict\"\n");
     m.push_str("config = { inspect = true, mutate = true }\n\n");
 
     if needs_file {
-        // read+write, no allowed_paths restriction (the sandbox root is the boundary).
         m.push_str("[permission_policy.file_system]\n");
         m.push_str("type = \"restrict\"\n");
         m.push_str("config = { read = true, write = true, execute = false }\n\n");
@@ -184,11 +181,7 @@ fn generate_manifest(roster: &str, wasm: &str, record_dir: Option<&str>) -> Resu
         m.push_str(&format!("[[handler]]\ntype = \"{h}\"\n\n"));
     }
     if !http_hosts.is_empty() {
-        let hosts = http_hosts
-            .iter()
-            .map(|h| format!("\"{h}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let hosts = http_hosts.iter().map(|h| format!("\"{h}\"")).collect::<Vec<_>>().join(", ");
         m.push_str(&format!("[[handler]]\ntype = \"http-client\"\nallowed_hosts = [{hosts}]\n\n"));
     }
     if needs_file {
@@ -202,20 +195,24 @@ fn generate_manifest(roster: &str, wasm: &str, record_dir: Option<&str>) -> Resu
     Ok(m)
 }
 
-/// Extract the host from an http(s) URL without pulling in a url crate.
 fn url_host(url: &str) -> Option<String> {
     let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let host = authority.split(':').next().unwrap_or(authority); // drop :port
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
-    }
+    let host = authority.split(':').next().unwrap_or(authority);
+    (!host.is_empty()).then(|| host.to_string())
 }
 
-async fn spawn(args: SpawnArgs) -> Result<()> {
-    let (manifest, manifest_dir) = load_manifest(&args)?;
+async fn spawn(cmd: &Cmd) -> Result<()> {
+    let Cmd::Spawn(args) = cmd;
+
+    // Default: bare command streams the pretty chain; --logs alone means logs-only.
+    let chain_mode = match (args.chain, args.logs) {
+        (Some(m), _) => Some(m),
+        (None, true) => None,
+        (None, false) => Some(ChainMode::Pretty),
+    };
+
+    let (manifest, manifest_dir) = load_manifest(args)?;
 
     // --- in-process theater runtime (mirrors theater-cli's spawn bring-up) ---
     let (theater_tx, theater_rx) = mpsc::unbounded_channel::<TheaterCommand>();
@@ -223,7 +220,9 @@ async fn spawn(args: SpawnArgs) -> Result<()> {
     let handler_registry = theater_stage::standard_handlers(
         theater_tx.clone(),
         &theater_stage::StandardHandlers {
-            show_actor_logs: true, // actor self.log lines print directly — we want them
+            // actor self.log lines are chain events; we render them in --chain pretty,
+            // so keep the handler from also printing them (no double output).
+            show_actor_logs: false,
             resource_cache: resource_cache.clone(),
         },
     );
@@ -245,7 +244,7 @@ async fn spawn(args: SpawnArgs) -> Result<()> {
         }
     });
 
-    // --- resolve + load the wasm, then spawn (setup + auto-init) ---
+    // --- resolve + load wasm, then spawn (setup + auto-init) ---
     let wasm_path = if manifest.package.starts_with('/') || manifest.package.contains("://") {
         manifest.package.clone()
     } else {
@@ -277,16 +276,16 @@ async fn spawn(args: SpawnArgs) -> Result<()> {
         Ok(Err(e)) => return Err(anyhow!("actor failed to start: {e}")),
         Err(e) => return Err(anyhow!("spawn response dropped: {e}")),
     };
-    eprintln!("supervisor: spawned root {root_id} — streaming chain (Ctrl+C to stop)\n");
+    eprintln!("supervisor: spawned root {root_id} (Ctrl+C to stop)\n");
 
-    // --- stream events until the root terminates or Ctrl+C ---
     loop {
         tokio::select! {
             event = global_rx.recv() => {
                 let Some((actor_id, ev)) = event else { break };
-                match args.format {
-                    Format::Short => print!("{}", short_line(&ev, &actor_id)),
-                    Format::Pretty => println!("{}", pretty_line(&ev, &actor_id)),
+                match chain_mode {
+                    Some(ChainMode::Pretty) => println!("{}", pretty_line(&ev, &actor_id)),
+                    Some(ChainMode::Compact) => println!("{}", compact_line(&ev, &actor_id)),
+                    None => {}
                 }
                 if actor_id == root_id && ev.event_type == "terminated" {
                     eprintln!("\nsupervisor: root {root_id} terminated — exiting");
@@ -308,36 +307,102 @@ async fn spawn(args: SpawnArgs) -> Result<()> {
     Ok(())
 }
 
-fn short_line(ev: &ChainEvent, actor_id: &TheaterId) -> String {
-    let id = actor_id.to_string();
-    format!("[{}] {}\n", &id[..8.min(id.len())], ev)
+// ---- chain rendering ----
+
+fn sid(actor_id: &TheaterId) -> String {
+    let s = actor_id.to_string();
+    s[..8.min(s.len())].to_string()
 }
 
-/// One decoded, readable line per event: `[id] <symbol> <summary>`.
+/// Decoded, readable line: narration (`» msg`), host calls with args, lifecycle, wasm.
 fn pretty_line(ev: &ChainEvent, actor_id: &TheaterId) -> String {
-    let id = actor_id.to_string();
-    let sid = &id[..8.min(id.len())];
-    let summary = match decode_chain_event_payload(&ev.data) {
-        Some(ChainEventPayload::Lifecycle(ActorLifecycleEvent::Spawned)) => "● spawned".to_string(),
-        Some(ChainEventPayload::Lifecycle(ActorLifecycleEvent::Paused)) => "⏸ paused".to_string(),
-        Some(ChainEventPayload::Lifecycle(ActorLifecycleEvent::Resumed)) => "▶ resumed".to_string(),
-        Some(ChainEventPayload::Lifecycle(ActorLifecycleEvent::Terminated { cause })) => {
-            format!("✖ terminated ({})", cause_str(&cause))
+    let body = match decode_chain_event_payload(&ev.data) {
+        Some(ChainEventPayload::Lifecycle(l)) => lifecycle_str(&l),
+        Some(ChainEventPayload::HostFunction(h)) => {
+            if h.interface.ends_with("/self") && h.function == "log" {
+                format!("» {}", val_str(&h.input))
+            } else {
+                let arg = truncate(val_str(&h.input), 60);
+                if arg.is_empty() {
+                    format!("→ {}/{}", short_iface(&h.interface), h.function)
+                } else {
+                    format!("→ {}/{}({})", short_iface(&h.interface), h.function, arg)
+                }
+            }
         }
-        Some(ChainEventPayload::HostFunction(_)) => format!("→ {}", ev.event_type),
-        Some(ChainEventPayload::Wasm(_)) => format!("⚙ {}", ev.event_type),
-        Some(ChainEventPayload::ReplaySummary(_)) => format!("↻ {}", ev.event_type),
+        Some(ChainEventPayload::Wasm(w)) => match w {
+            WasmEventData::WasmCall { function_name, .. } => format!("⚙ call {function_name}"),
+            WasmEventData::WasmResult { function_name, .. } => format!("⚙ result {function_name}"),
+            WasmEventData::WasmError { function_name, message } => {
+                format!("✖ wasm error in {function_name}: {}", truncate(message, 80))
+            }
+            _ => format!("⚙ {}", ev.event_type),
+        },
+        Some(ChainEventPayload::ReplaySummary(_)) => "↻ replay-summary".to_string(),
         None => ev.event_type.clone(),
     };
-    format!("[{sid}] {summary}")
+    format!("[{}] {}", sid(actor_id), body)
 }
 
-fn cause_str(cause: &TerminationCause) -> &'static str {
-    match cause {
-        TerminationCause::Completed { .. } => "Completed",
-        TerminationCause::Failed { .. } => "Failed",
-        TerminationCause::Stopped => "Stopped",
-        TerminationCause::Killed => "Killed",
-        TerminationCause::PeerKilled { .. } => "PeerKilled",
+/// Terse skim: type only, no arg decoding.
+fn compact_line(ev: &ChainEvent, actor_id: &TheaterId) -> String {
+    let body = match decode_chain_event_payload(&ev.data) {
+        Some(ChainEventPayload::Lifecycle(l)) => lifecycle_str(&l),
+        Some(ChainEventPayload::HostFunction(h)) => {
+            format!("{}/{}", short_iface(&h.interface), h.function)
+        }
+        Some(ChainEventPayload::Wasm(w)) => match w {
+            WasmEventData::WasmCall { function_name, .. } => format!("wasm:call {function_name}"),
+            WasmEventData::WasmResult { function_name, .. } => format!("wasm:result {function_name}"),
+            WasmEventData::WasmError { function_name, .. } => format!("wasm:error {function_name}"),
+            _ => ev.event_type.clone(),
+        },
+        Some(ChainEventPayload::ReplaySummary(_)) => "replay-summary".to_string(),
+        None => ev.event_type.clone(),
+    };
+    format!("[{}] {}", sid(actor_id), body)
+}
+
+fn lifecycle_str(l: &ActorLifecycleEvent) -> String {
+    match l {
+        ActorLifecycleEvent::Spawned => "● spawned".to_string(),
+        ActorLifecycleEvent::Paused => "⏸ paused".to_string(),
+        ActorLifecycleEvent::Resumed => "▶ resumed".to_string(),
+        ActorLifecycleEvent::Terminated { cause } => format!("✖ terminated ({})", cause_str(cause)),
     }
+}
+
+fn cause_str(c: &TerminationCause) -> String {
+    match c {
+        TerminationCause::Completed { .. } => "Completed".to_string(),
+        TerminationCause::Failed { error } => format!("Failed: {}", truncate(error.clone(), 80)),
+        TerminationCause::Stopped => "Stopped".to_string(),
+        TerminationCause::Killed => "Killed".to_string(),
+        TerminationCause::PeerKilled { peer } => {
+            format!("PeerKilled by {}", &peer[..8.min(peer.len())])
+        }
+    }
+}
+
+/// Pull a readable string out of a packr Value (for log messages + call args).
+fn val_str(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Tuple(items) if items.len() == 1 => val_str(&items[0]),
+        Value::Option { value: Some(b), .. } => val_str(b),
+        Value::Option { value: None, .. } => String::new(),
+        other => format!("{other}"),
+    }
+}
+
+fn truncate(s: String, n: usize) -> String {
+    if s.chars().count() > n {
+        s.chars().take(n).collect::<String>() + "…"
+    } else {
+        s
+    }
+}
+
+fn short_iface(i: &str) -> String {
+    i.strip_prefix("theater:simple/").unwrap_or(i).to_string()
 }

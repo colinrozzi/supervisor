@@ -11,7 +11,7 @@ as a native host, a separate dependency tree from the wasm guest in `../supervis
 ## `supervisor spawn`
 
 ```sh
-# roster-in (default): generate the manifest, spawn, stream the chain
+# roster-in (default): generate the manifest, spawn, stream the pretty chain
 supervisor spawn roster.json --wasm path/to/supervisor.wasm
 
 # a service that records to a file needs a sandbox root
@@ -20,9 +20,23 @@ supervisor spawn roster.json --wasm … --record-dir ./rec
 # spawn a ready manifest raw instead
 supervisor spawn --manifest supervisor.toml
 
-# see the generated manifest; pick the event format
-supervisor spawn roster.json --wasm … --show-manifest --format pretty|short
+# see the generated manifest
+supervisor spawn roster.json --wasm … --show-manifest
 ```
+
+### Output: two independent streams
+
+- **`--chain [compact|pretty]`** — the actors' **chain** (the record of every event).
+  `pretty` (default) decodes it: `» <log message>`, `→ <iface>/<fn>(<args>)`,
+  `⚙ call|result <fn>`, `● spawned`, `✖ terminated (<cause>)`. `compact` is a terse
+  type-only skim. Bare `--chain` = pretty.
+- **`--logs`** — theater's **runtime logs** (the host's internals: manifest parse,
+  permission calc, scheduling, errors). Level via `RUST_LOG` (e.g. `RUST_LOG=theater=debug`),
+  else `info`. Off by default.
+
+The two compose. With neither flag, the default is `--chain pretty`; `--logs` alone
+gives logs-only (chain off). Actor `self.log` output lives in the chain (rendered as
+`»` lines in pretty), so there's no separate actor-log stream to toggle.
 
 `roster.json` is the supervisor's init config — `{"services":[{handle, manifest,
 max?, window_ms?, record?}, …]}`. From it the CLI **generates the manifest**:
