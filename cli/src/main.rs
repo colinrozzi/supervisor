@@ -51,6 +51,9 @@ enum Cmd {
     },
     /// Remove a service (the supervisor stops it).
     Remove { handle: String, #[arg(long, default_value = "9000")] port: u16 },
+    /// Replace the whole desired roster from a file (the supervisor diffs + reconciles:
+    /// stops what's gone, spawns what's new, leaves the rest).
+    Apply { roster: String, #[arg(long, default_value = "9000")] port: u16 },
     /// Dump a service's in-memory chain (needs record or keep_chain).
     Chain { handle: String, #[arg(long, default_value = "9000")] port: u16 },
 }
@@ -145,6 +148,7 @@ async fn main() {
         Cmd::Add { handle, manifest, port, max, window_ms, keep_chain } => {
             control_print(*port, &add_op(handle, manifest, *max, *window_ms, *keep_chain))
         }
+        Cmd::Apply { roster, port } => apply_op(roster).and_then(|op| control_print(*port, &op)),
     };
     if let Err(e) = res {
         eprintln!("supervisor: {e:#}");
@@ -174,6 +178,22 @@ fn json_op(op: &str, fields: &[(&str, &str)]) -> String {
     }
     s.push('}');
     s
+}
+
+/// Build an `apply` request from a roster file (a `{"services":[…]}` object, or a bare
+/// `[…]` array of service entries).
+fn apply_op(roster_path: &str) -> Result<String> {
+    let text = std::fs::read_to_string(roster_path)
+        .with_context(|| format!("reading roster {roster_path}"))?;
+    let v: serde_json::Value = serde_json::from_str(&text).context("roster is not valid JSON")?;
+    let services = match v {
+        serde_json::Value::Object(mut o) => o
+            .remove("services")
+            .ok_or_else(|| anyhow!("roster object has no \"services\" array"))?,
+        arr @ serde_json::Value::Array(_) => arr,
+        _ => return Err(anyhow!("roster must be a {{\"services\":[…]}} object or a [...] array")),
+    };
+    Ok(serde_json::json!({ "op": "apply", "services": services }).to_string())
 }
 
 /// Build an `add` request with a nested service object.

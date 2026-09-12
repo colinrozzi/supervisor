@@ -77,8 +77,12 @@ supervisor list                                 # the live roster (desired + sta
 supervisor status heartbeat
 supervisor add worker ./worker.toml [--max 5 --window-ms 60000 --keep-chain]
 supervisor remove worker                        # supervisor stops it
+supervisor apply new-roster.json                # replace the whole roster (diff + reconcile)
 supervisor chain heartbeat                      # in-memory chain (needs record or keep_chain)
 ```
+
+`apply` is the GitOps move: hand it a full `{"services":[…]}` roster and the supervisor
+converges — stops what's gone, spawns what's new, leaves unchanged handles running.
 
 (Omit `--control-port` entirely to leave the surface off. All verbs take `--port N`.)
 
