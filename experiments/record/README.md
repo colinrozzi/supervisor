@@ -34,22 +34,24 @@ Decode it and you get the faithful event — the `terminated` one even carries
   `http-client.request` a POST to `record.url`. Recording is independent of the
   crash-catch: every event is recorded; only `terminated` drives the reconcile.
 
-## Sinks: `http` (green) and `file` (wired, blocked on a theater gap)
+## Sinks: `http` and `file` — both green
 
 `record` is a tagged union — `{"kind":"http","url":…}` or `{"kind":"file","path":…}`
 — backed by a `Sink` enum; `handle-actor-event` dispatches HTTP→POST, File→`append-file`.
+Both proven green E2E on theater `4e4e67d3` (15 events across 3 incarnations, reconcile
+tripping at max=2).
 
-- **http** — proven green E2E (above). POST each event via the http-client handler.
-- **file** — wired against theater's filesystem handler (#207, rev `0b60fdb6`):
-  `Sink::File(path)` appends each JSON line via `filesystem.append-file`, sandboxed to
-  the handler's configured root. The code works (capability + path resolution both pass),
-  but the write is **currently blocked by a theater permission gap**: a `theater spawn`
-  root grants `file_system.allowed_paths = ["/"]`, and the handler resolves allowed-paths
-  *relative to the sandbox root* — which rejects the absolute `/`, so every write is
-  `permission-denied: … outside the allowed-paths`. `permission_policy` restrict can't fix
-  it (a relative child entry fails restrict's `starts_with("/")` superset check; restrict
-  can't widen to `None`). Reported to theater-dev; candidate fix is the handler mapping an
-  allowed-path `/` to the sandbox root. The file sink verifies the same day that lands.
+- **http** — POST each event via the http-client handler (needs a collector; see below).
+- **file** — append each JSON line via theater's filesystem handler
+  (`filesystem.append-file`), sandboxed to the handler's configured root. Self-contained
+  (no collector): the manifest declares `[[handler]] type="filesystem"` with a `path`, and
+  `record:{kind:"file",path:"crasher.jsonl"}` lands at `<root>/crasher.jsonl`.
+
+  *History:* the file sink was briefly blocked — a `theater spawn` root grants
+  `file_system.allowed_paths=["/"]`, and the handler first resolved allowed-paths
+  sandbox-relative, rejecting the absolute `/`. Fixed in theater **#208** (rev `4e4e67d3`):
+  allowed-path entries are now root-relative and a bare `/` means the sandbox root, so the
+  inherited `["/"]` = "anywhere in my sandbox". No permission grant needed in the manifest.
 
 ## Run it
 

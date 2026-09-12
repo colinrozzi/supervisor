@@ -70,15 +70,46 @@ type = "http-client"
 allowed_hosts = ["127.0.0.1"]
 EOF
 
-echo "=== start collector on 127.0.0.1:$PORT ==="
+export THEATER_HOME="${THEATER_HOME:-$RUNDIR/theater-home}"
+
+# ---- sink 1: HTTP (needs the collector) ----
+echo "=== [http sink] start collector on 127.0.0.1:$PORT ==="
 "$RUNDIR/collector" "127.0.0.1:$PORT" "$CAP" &
 COLL=$!; trap 'kill $COLL 2>/dev/null || true' EXIT
 sleep 1
-
-echo "=== run (18s) ==="
-export THEATER_HOME="${THEATER_HOME:-$RUNDIR/theater-home}"
+echo "=== [http sink] run (18s) ==="
 timeout 18 "$THEATER" spawn "$RUNDIR/supervisor-record.toml" --events --events-format short --log-level warn \
-  | grep -E 'recorded crasher|record POST failed|terminated —|BLOCKED' | grep -v ChainEventPayload || true
-
-echo "=== captured events ($(wc -l < "$CAP") lines) — types: ==="
+  | grep -E 'recorded crasher|record write failed|terminated —|BLOCKED' | grep -v ChainEventPayload || true
+kill $COLL 2>/dev/null || true
+echo "=== [http sink] captured ($(wc -l < "$CAP") lines) — types: ==="
 grep -oE '"type":"[^"]*"' "$CAP" || true
+
+# ---- sink 2: FILE (self-contained; theater's filesystem handler, needs #208 rev) ----
+FSROOT="$RUNDIR/rec-fs"; mkdir -p "$FSROOT"; : > "$FSROOT/crasher.jsonl"
+cat > "$RUNDIR/supervisor-record-file.toml" <<EOF
+name = "supervisor"
+version = "0.0.1"
+package = "$SUP_WASM"
+initial_state = '{"services":[{"handle":"crasher","manifest":"$RUNDIR/crash-child.toml","max":2,"window_ms":60000,"record":{"kind":"file","path":"crasher.jsonl"}}]}'
+
+[permission_policy.runtime]
+type = "restrict"
+config = { inspect = true, mutate = true }
+
+[[handler]]
+type = "self"
+[[handler]]
+type = "runtime"
+[[handler]]
+type = "lifecycle"
+[[handler]]
+type = "timer"
+[[handler]]
+type = "filesystem"
+path = "$FSROOT"
+EOF
+echo "=== [file sink] run (18s) — appends to $FSROOT/crasher.jsonl ==="
+timeout 18 "$THEATER" spawn "$RUNDIR/supervisor-record-file.toml" --events --events-format short --log-level warn \
+  | grep -E 'recorded crasher|record write failed|terminated —|BLOCKED' | grep -v ChainEventPayload || true
+echo "=== [file sink] captured ($(wc -l < "$FSROOT/crasher.jsonl") lines) — types: ==="
+grep -oE '"type":"[^"]*"' "$FSROOT/crasher.jsonl" || true
