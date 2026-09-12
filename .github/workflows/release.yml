@@ -44,6 +44,12 @@ jobs:
           cp target/wasm32-unknown-unknown/release/supervisor.wasm dist/supervisor.wasm
           ( cd dist && sha256sum supervisor supervisor.wasm > SHA256SUMS )
 
+      - name: Assert the binary is truly static (portability guarantee)
+        run: |
+          file dist/supervisor
+          file dist/supervisor | grep -q "statically linked" \
+            || { echo "::error::supervisor is not statically linked — would not exec in other containers"; exit 1; }
+
       - name: Attach to the GitHub Release
         uses: softprops/action-gh-release@v2
         with:

@@ -17,7 +17,8 @@ echo "supervisor-upgrade: fetching $REPO@$TAG …"
 
 # Prefer gh (agents are gh-authed); fall back to curl against the release API.
 if command -v gh >/dev/null 2>&1; then
-  args=(release download --repo "$REPO" --clobber --dir "$SHARE_DIR" --pattern 'supervisor' --pattern 'supervisor.wasm')
+  args=(release download --repo "$REPO" --clobber --dir "$SHARE_DIR" \
+        --pattern 'supervisor' --pattern 'supervisor.wasm' --pattern 'SHA256SUMS')
   [ "$TAG" = "latest" ] || args+=("$TAG")
   gh "${args[@]}"
 else
@@ -26,6 +27,15 @@ else
   [ "$TAG" = "latest" ] || url="$base/download/$TAG"
   curl -fSL "$url/supervisor"       -o "$SHARE_DIR/supervisor"
   curl -fSL "$url/supervisor.wasm"  -o "$SHARE_DIR/supervisor.wasm" || true
+  curl -fSL "$url/SHA256SUMS"       -o "$SHARE_DIR/SHA256SUMS"      || true
+fi
+
+# Integrity: verify the binary against the published checksums before installing it.
+if [ -f "$SHARE_DIR/SHA256SUMS" ]; then
+  ( cd "$SHARE_DIR" && sha256sum -c --ignore-missing SHA256SUMS ) \
+    || { echo "supervisor-upgrade: checksum verification FAILED — refusing to install"; exit 1; }
+else
+  echo "supervisor-upgrade: WARNING no SHA256SUMS found — skipping integrity check"
 fi
 
 install -m 0755 "$SHARE_DIR/supervisor" "$BIN_DIR/supervisor"
