@@ -56,6 +56,8 @@ theater runtime and streams the decoded chain to stdout — it generates the man
 (handlers + permission grants) for you. See `cli/README.md`. The dev loop without
 hand-writing manifests or remembering `theater spawn` flags.
 
+**Getting started / using it:** see `docs/QUICKSTART.md`.
+
 Everything past v0 — live roster mutation over the network, git-served rosters,
 deploy/hot-swap, the external stall-probe, off-box notify — is "another way to
 feed or edit the same desired state." See `docs/DESIGN.md`.
