@@ -1,27 +1,23 @@
-[63ecb300] [supervisor] init — reconciling roster
-[61c7a69f] [crash-child] init — arming self-terminate timer (300ms)
-[63ecb300] [supervisor] spawned crasher as 61c7a69f-6e86-424a-9837-1ca06b2fa4d0
-[63ecb300] [supervisor] roster up: 1 service(s)
-[61c7a69f] [crash-child] tick — self-terminating
-[63ecb300] [supervisor] crasher (61c7a69f-6e86-424a-9837-1ca06b2fa4d0) terminated — recent_restarts=0 max=5
-[619dcb38] [crash-child] init — arming self-terminate timer (300ms)
-[63ecb300] [supervisor] spawned crasher as 619dcb38-effc-4d15-9640-ebe6d7c2dbaf
-[619dcb38] [crash-child] tick — self-terminating
-[63ecb300] [supervisor] crasher (619dcb38-effc-4d15-9640-ebe6d7c2dbaf) terminated — recent_restarts=1 max=5
-[ef360330] [crash-child] init — arming self-terminate timer (300ms)
-[63ecb300] [supervisor] spawned crasher as ef360330-0a4a-4c7f-8f15-71739240fed7
-[ef360330] [crash-child] tick — self-terminating
-[63ecb300] [supervisor] crasher (ef360330-0a4a-4c7f-8f15-71739240fed7) terminated — recent_restarts=2 max=5
-[b1ef9fbc] [crash-child] init — arming self-terminate timer (300ms)
-[63ecb300] [supervisor] spawned crasher as b1ef9fbc-a45b-49aa-8a01-49638e3dcc9d
-[b1ef9fbc] [crash-child] tick — self-terminating
-[63ecb300] [supervisor] crasher (b1ef9fbc-a45b-49aa-8a01-49638e3dcc9d) terminated — recent_restarts=3 max=5
-[1844f3e9] [crash-child] init — arming self-terminate timer (300ms)
-[63ecb300] [supervisor] spawned crasher as 1844f3e9-6eaf-453e-85bb-4bcb082bf399
-[1844f3e9] [crash-child] tick — self-terminating
-[63ecb300] [supervisor] crasher (1844f3e9-6eaf-453e-85bb-4bcb082bf399) terminated — recent_restarts=4 max=5
-[cd1cd6fd] [crash-child] init — arming self-terminate timer (300ms)
-[63ecb300] [supervisor] spawned crasher as cd1cd6fd-cb0f-413e-bf35-6640211cf598
-[cd1cd6fd] [crash-child] tick — self-terminating
-[63ecb300] [supervisor] crasher (cd1cd6fd-cb0f-413e-bf35-6640211cf598) terminated — recent_restarts=5 max=5
-[63ecb300] [supervisor] crash-loop on crasher (6 in 60000ms) — BLOCKED, not respawning
+[ff18e6ee] » [supervisor] init — reconciling roster
+[6047230a] » [crash-child] init — arming self-terminate timer (300ms)
+[ff18e6ee] » [supervisor] spawned crasher as 6047230a-5383-4710-bc1d-b75cec4355b9
+[ff18e6ee] » [supervisor] roster up: 1 service(s)
+[6047230a] » [crash-child] tick — crashing on purpose
+[6047230a] ✖ terminated (Failed)
+[ff18e6ee] » [supervisor] crasher (6047230a-5383-4710-bc1d-b75cec4355b9) crashed (Failed) — recent_restarts=0 max=3
+[08469e54] » [crash-child] init — arming self-terminate timer (300ms)
+[ff18e6ee] » [supervisor] spawned crasher as 08469e54-ee41-4705-bb83-5cf2c5728080
+[08469e54] » [crash-child] tick — crashing on purpose
+[08469e54] ✖ terminated (Failed)
+[ff18e6ee] » [supervisor] crasher (08469e54-ee41-4705-bb83-5cf2c5728080) crashed (Failed) — recent_restarts=1 max=3
+[341035f2] » [crash-child] init — arming self-terminate timer (300ms)
+[ff18e6ee] » [supervisor] spawned crasher as 341035f2-08c9-4356-8dad-da5f18125205
+[341035f2] » [crash-child] tick — crashing on purpose
+[341035f2] ✖ terminated (Failed)
+[ff18e6ee] » [supervisor] crasher (341035f2-08c9-4356-8dad-da5f18125205) crashed (Failed) — recent_restarts=2 max=3
+[7056dee7] » [crash-child] init — arming self-terminate timer (300ms)
+[ff18e6ee] » [supervisor] spawned crasher as 7056dee7-5083-4fe7-bca6-25453e5c29aa
+[7056dee7] » [crash-child] tick — crashing on purpose
+[7056dee7] ✖ terminated (Failed)
+[ff18e6ee] » [supervisor] crasher (7056dee7-5083-4fe7-bca6-25453e5c29aa) crashed (Failed) — recent_restarts=3 max=3
+[ff18e6ee] » [supervisor] crash-loop on crasher (4 in 60000ms) — BLOCKED, not respawning

@@ -1,12 +1,8 @@
 //! crash-child — inits OK (so spawn returns a live id), arms a fast timer, then
-//! terminates itself on the first tick via `self.shutdown` → TerminationCause::Completed
-//! → the terminal `"terminated"` lifecycle event → the supervisor's monitor fires →
-//! reconcile respawns it. The roster child for Experiment 1 (prove the loop).
-//!
-//! (A `panic!()`-style hard crash would exercise the `Failed` cause, but a trap
-//! inside a timer `handle-tick` callback is currently swallowed by the host and
-//! never surfaces as an ActorError/terminal event — noted to theater-dev. A clean
-//! self-shutdown is the deterministic terminal path and is all the loop needs.)
+//! `panic!()`s on the first tick. Since packr-guest 0.24.1 the panic handler TRAPS
+//! (wasm unreachable) instead of looping, so the trap surfaces as
+//! TerminationCause::Failed → the supervisor's monitor fires → reconcile respawns it
+//! (rate-limited). The roster child for the reconcile loop — the real Failed path.
 #![no_std]
 extern crate alloc;
 use alloc::boxed::Box;
@@ -19,7 +15,6 @@ pack_types! {
     imports {
         theater:simple/self {
             log: func(msg: string),
-            shutdown: func(data: option<list<u8>>) -> result<_, string>,
         }
         theater:simple/timer { set-interval: func(name: string, interval-ms: u64) -> result<string, string>, }
     }
@@ -30,8 +25,6 @@ pack_types! {
 }
 #[import(module = "theater:simple/self", name = "log")]
 fn log(msg: String);
-#[import(module = "theater:simple/self", name = "shutdown")]
-fn shutdown(data: Option<alloc::vec::Vec<u8>>) -> Result<(), String>;
 #[import(module = "theater:simple/timer", name = "set-interval")]
 fn set_interval(name: String, interval_ms: u64) -> Result<String, String>;
 
@@ -48,7 +41,8 @@ fn init(_config: Value) -> Value {
 }
 #[export(name = "theater:simple/timer.handle-tick")]
 fn handle_tick(_input: Value) -> Value {
-    log(String::from("[crash-child] tick — self-terminating"));
-    let _ = shutdown(None);
-    ok_unit()
+    log(String::from("[crash-child] tick — crashing on purpose"));
+    // packr-guest 0.24.1's panic handler traps (wasm unreachable) instead of looping,
+    // so this surfaces as TerminationCause::Failed → the supervisor respawns it.
+    panic!("crash-child: deliberate crash");
 }

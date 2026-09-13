@@ -302,6 +302,34 @@ fn error_detail(v: Value) -> String {
     }
 }
 
+/// Decode a terminal event's `data` (packr ChainEventPayload) and pull out the
+/// TerminationCause case name — `"Completed" | "Failed" | "Stopped" | "Killed" | "PeerKilled"`.
+/// The payload nests `Variant("Lifecycle",[Variant("Terminated",[<cause>])])`, so we just
+/// search the decoded tree for the cause variant (robust to record-wrapping).
+fn decode_cause(data: &[u8]) -> Option<String> {
+    let v = packr_guest::decode(data).ok()?;
+    const CAUSES: &[&str] = &["Completed", "Failed", "Stopped", "Killed", "PeerKilled"];
+    find_variant_case(&v, CAUSES)
+}
+fn find_variant_case(v: &Value, wanted: &[&str]) -> Option<String> {
+    match v {
+        Value::Variant { case_name, payload, .. } => {
+            if wanted.contains(&case_name.as_str()) {
+                return Some(case_name.clone());
+            }
+            payload.iter().find_map(|p| find_variant_case(p, wanted))
+        }
+        Value::Tuple(items) => items.iter().find_map(|it| find_variant_case(it, wanted)),
+        Value::List { items, .. } => items.iter().find_map(|it| find_variant_case(it, wanted)),
+        Value::Record { fields, .. } => fields.iter().find_map(|(_, val)| find_variant_case(val, wanted)),
+        Value::Option { value: Some(b), .. } => find_variant_case(b, wanted),
+        Value::Result { value, .. } => match value {
+            Ok(b) | Err(b) => find_variant_case(b, wanted),
+        },
+        _ => None,
+    }
+}
+
 fn runtime_spawn(manifest: &str) -> Result<String, String> {
     match runtime_spawn_raw(manifest.to_string(), None, None) {
         // packr-native result
@@ -567,10 +595,25 @@ fn handle_actor_event(input: Value) -> Value {
         }
     }
 
-    // Only terminations drive the reconcile. exp1 respawns on ANY terminated; gating
-    // on TerminationCause::Failed is #9 (needs pack-dev's panic-trap fix to emit Failed).
+    // Only terminations drive the reconcile.
     if event_type != "terminated" {
         return ok_unit();
+    }
+
+    // Respawn only on a FAILED termination (a crash/trap). Completed / Stopped / Killed /
+    // PeerKilled are intentional — leave them down (this is what makes `remove`/self-shutdown
+    // not trigger a zombie respawn). Decode the cause from the event payload; if it can't be
+    // decoded, respawn defensively so a real crash is never missed.
+    let cause = decode_cause(&data);
+    if !matches!(cause.as_deref(), Some("Failed") | None) {
+        log(format!(
+            "[supervisor] {} terminated ({}) — intentional, not respawning",
+            subject, cause.as_deref().unwrap_or("?")
+        ));
+        return ok_unit();
+    }
+    if cause.is_none() {
+        log(format!("[supervisor] {} terminated (cause undecodable) — respawning defensively", subject));
     }
 
     let now = timer_now();
@@ -588,7 +631,7 @@ fn handle_actor_event(input: Value) -> Value {
         svc.restarts.retain(|t| now.saturating_sub(*t) <= window);
         let recent = svc.restarts.len() as u32;
         log(format!(
-            "[supervisor] {} ({}) terminated — recent_restarts={} max={}",
+            "[supervisor] {} ({}) crashed (Failed) — recent_restarts={} max={}",
             svc.handle, subject, recent, svc.max
         ));
         if svc.blocked {

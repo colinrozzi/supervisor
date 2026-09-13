@@ -1,9 +1,11 @@
 # Experiment 1 — prove the reconcile loop
 
-**Status: GREEN (2026-09-11).** The first end-to-end proof that the supervisor's
-core loop works — re-verified on the post-#206 lifecycle reshape (theater rev
-`c197d707`: full-chain `monitor`, `monitor-filtered`, `handle-actor-event`).
-Originally proven on `c3937bdc`.
+**Status: GREEN.** End-to-end proof of the supervisor's core loop — now on the REAL
+`Failed` path (packr-guest `0.24.1` + theater `82cc6217`): the child `panic!()`s, the
+panic traps to `TerminationCause::Failed`, and the supervisor respawns only on `Failed`.
+(History: first proven on `c3937bdc` with a `self.shutdown`→`Completed` stand-in, because
+a guest panic used to loop instead of trap; 0.24.1 fixed the panic handler, so this is
+the authentic crash loop.)
 
 ## What it proves
 
@@ -12,13 +14,14 @@ the full primitive path:
 
 1. **init** → `runtime.spawn` the child + `lifecycle.monitor-filtered(id, terminations())`
    it (woken only on the child's terminal event, not its whole chain).
-2. child self-terminates → the runtime emits the terminal `"terminated"` event →
-   the filtered monitor delivers it to `lifecycle-handlers.handle-actor-event`.
-3. the supervisor **reconciles**: desired-but-now-absent → respawn (rate-limited).
-4. after `max` (5) restarts inside `window_ms` (60s), the rate-limiter **trips** →
+2. child `panic!()`s → the trap surfaces as the terminal `"terminated"` event with
+   `TerminationCause::Failed` → delivered to `lifecycle-handlers.handle-actor-event`.
+3. the supervisor **decodes the cause and respawns only on `Failed`** (Completed / Stopped /
+   Killed / PeerKilled are intentional — left down), rate-limited.
+4. after `max` (3) restarts inside `window_ms` (60s), the rate-limiter **trips** →
    the service is `BLOCKED`, no further respawn — and the supervisor itself stays up.
 
-See `run.log` for the captured passing trace (spawn → 5 respawns → block).
+See `run.log` for the captured passing trace (crash → 3 respawns → block, all `Failed`).
 
 ## Run it
 
@@ -47,19 +50,16 @@ supervisor / manifest, not just here):
    `[permission_policy.runtime] type="restrict", config={inspect=true, mutate=true}`.
    Without it, `spawn` is refused before it reaches the handler.
 
-3. **A trap inside a timer `handle-tick` callback is currently swallowed by the
-   host** — it produces no `ActorError`, no terminal event, no log; the actor just
-   goes silent. So a `panic!()`-style hard crash does *not* exercise the `Failed`
-   path here. This child self-terminates via `self.shutdown` (→ `TerminationCause::
-   Completed`), the deterministic terminal path, which is all the loop needs.
-   *(Reported to theater-dev — the timer-callback trap should surface as a
-   supervised `Failed` termination.)*
+3. **A guest `panic!()` used to loop instead of trap** — packr-guest ≤0.24.0's
+   `#[panic_handler]` did `loop {}`, so a panic spun silently: no `ActorError`, no
+   terminal event. RESOLVED in packr-guest **0.24.1** (panic handler → `wasm::unreachable()`),
+   so a panic now traps → `TerminationCause::Failed`. *(Root-caused by theater-dev, fixed
+   by pack-dev in pack #132.)*
 
-## Caveat on this experiment vs the v0 design
+## Respawn is gated on `Failed` (matches the v0 design)
 
-The v0 design says **respawn only on `Failed`** (Completed/Stopped/Killed are
-intentional). This experiment respawns on *any* `"terminated"` — it does not yet
-decode `TerminationCause` from the event `data`. That's the immediate next
-refinement (and needs the timer-trap gap above fixed to test the real `Failed`
-path). Here, the self-shutdown stands in as "the child died" purely to prove the
-spawn→monitor→event→reconcile→rate-limit machinery end-to-end.
+The supervisor decodes `TerminationCause` from the terminal event `data` (packr-decode
+→ find the cause variant) and **respawns only on `Failed`** — Completed / Stopped /
+Killed / PeerKilled are intentional and left down. This is what makes `remove`/self-shutdown
+not trigger a zombie respawn. If the cause can't be decoded, it respawns defensively (a
+real crash must never be missed).
