@@ -229,9 +229,17 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Build a 32-byte challenge nonce for this connection: SHA-256 over the monotonic
-/// timer + the connection id + a counter. Unique per connection; over TLS this is
-/// sufficient to bind each auth signature to a distinct session (see docs/remote-management.md
-/// for the freshness rationale — a crypto-grade `random` handler can replace this later).
+/// timer + the connection id + a counter.
+///
+/// SECURITY (load-bearing assumption): this nonce is PREDICTABLE, not secret. Access
+/// security rests on three things that DO hold — (1) the ed25519 signature, (2) the
+/// nonce being SERVER-generated and verified server-side (a client never supplies its
+/// own challenge), and (3) TLS confidentiality. The nonce provides *freshness* (each
+/// session's signature is distinct), not secrecy; captured (nonce,sig) pairs can't be
+/// replayed on a new connection because the server issues a new nonce each time. This is
+/// only safe while the server alone chooses the nonce: if any future change ever verified
+/// a client-supplied nonce or let a client influence the challenge, predictability would
+/// flip to exploitable. Swap to a crypto-grade CSPRNG (a `random` host fn) when available.
 fn make_nonce(conn: &str, counter: u64) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -823,14 +831,22 @@ fn handle_connection(input: Value) -> Value {
 
     // Authenticated path: ensure TLS, then an ed25519 challenge-response, before any op.
     if !authorized.is_empty() {
-        // The tcp handler auto-terminates TLS on accept when server_tls.enabled=true, so the
-        // connection may already be encrypted; otherwise this performs a STARTTLS-style upgrade.
-        // Either way we require an encrypted channel before the handshake.
+        // This is the ENCRYPTION GATE, and it fails CLOSED. The tcp handler auto-terminates
+        // TLS on accept when server_tls.enabled=true (→ "already TLS"); otherwise this performs
+        // a STARTTLS-style upgrade (→ Ok). BOTH outcomes mean the channel is encrypted. ANY other
+        // result — including a manifest that set authorized_keys but forgot server_tls, where the
+        // upgrade has no cert to use — falls through to close, and we return BEFORE sending the
+        // nonce or reading any auth bytes, so nothing sensitive crosses a plaintext channel.
+        //
+        // NOTE: this INFERS encryption from the upgrade result; the guest cannot yet positively
+        // assert "this conn is TLS" (no such tcp query exists — requested from theater-dev). Until
+        // then, `authorized_keys ⇒ server_tls` is a load-bearing manifest invariant (the CLI
+        // enforces it; docs/remote-management.md documents it; the bootstrap enforces it).
         match tcp_upgrade_to_tls_server(conn.clone()) {
             Ok(()) => {}
-            Err(e) if e.contains("already TLS") => {} // handler already terminated TLS
+            Err(e) if e.contains("already TLS") => {} // handler already terminated TLS on accept
             Err(e) => {
-                log(format!("[supervisor] control TLS upgrade failed: {}", e));
+                log(format!("[supervisor] control refusing unencrypted channel (TLS upgrade: {})", e));
                 let _ = tcp_close(conn);
                 return ok_unit();
             }
@@ -1020,6 +1036,38 @@ fn handle_op(line: &[u8]) -> String {
                 }
                 log(format!("[supervisor] control: applied +{} -{}", added, removed));
                 reply = format!("{{\"ok\":true,\"added\":{},\"removed\":{}}}", added, removed);
+            });
+        }
+        "restart" => {
+            let h = match handle_of() {
+                Some(h) => h,
+                None => return err_reply("restart: handle required"),
+            };
+            SupervisorState::with_mut(|st| {
+                reply = match st.services.iter().position(|s| s.handle == h) {
+                    Some(i) => {
+                        let old_id = st.services[i].current_id.clone();
+                        let manifest = st.services[i].manifest.clone();
+                        let full_chain = st.services[i].full_chain();
+                        // Intentional stop (cause=Stopped) — not respawned by the reconcile path;
+                        // we spawn a fresh incarnation ourselves and re-point current_id.
+                        if let Err(e) = runtime_stop_actor(&old_id) {
+                            log(format!("[supervisor] control: restart stop {} failed: {}", h, e));
+                        }
+                        match spawn_and_watch(&h, &manifest, full_chain) {
+                            Ok(new_id) => {
+                                let svc = &mut st.services[i];
+                                svc.current_id = new_id;
+                                svc.restarts.clear(); // a manual restart clears the crash-loop window
+                                svc.blocked = false;  // and unblocks a tripped breaker
+                                log(format!("[supervisor] control: restarted {}", h));
+                                ok_msg(&format!("restarted {}", h))
+                            }
+                            Err(e) => err_reply(&format!("restart spawn failed: {}", e)),
+                        }
+                    }
+                    None => err_reply(&format!("unknown handle '{}'", h)),
+                }
             });
         }
         other => return err_reply(&format!("unknown op '{}'", other)),

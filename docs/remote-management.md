@@ -46,10 +46,15 @@ client (native CLI)                         supervisor (wasm actor)
 - **authorized_keys**: a set of client ed25519 pubkeys the supervisor accepts,
   in its config (init state). Like `~/.ssh/authorized_keys`. Editable later via a
   control op (a bootstrapped key can authorize more) — v1 may seed-only.
-- **nonce freshness**: server-issued per connection. If theater's `random` handler
-  is crypto-grade + reachable, source it there; else a monotonic counter is
-  acceptable over an already-fresh TLS session for v1 (replay across sessions is
-  TLS-mitigated). Decide during build.
+- **nonce freshness**: the nonce is server-issued per connection and is
+  **predictable, not secret** — currently `SHA256(timer ‖ counter ‖ conn_id)`.
+  That is safe here because access security rests on (1) the ed25519 signature,
+  (2) the nonce being *server-generated and server-verified* (a client never
+  supplies its own challenge), and (3) TLS. The nonce provides *freshness*, not
+  secrecy: captured `(nonce,sig)` pairs can't be replayed since the server issues
+  a new nonce each connection. **Load-bearing assumption:** this holds only while
+  the server alone chooses the nonce. Near-list: swap to a crypto-grade CSPRNG
+  once a `random` host fn exists (pure defense-in-depth).
 - **server identity**: the client pins the server's self-signed cert fingerprint
   (known-hosts style) in its profile — so a MITM can't present a different cert.
 
@@ -83,6 +88,22 @@ Bootstrap provisions:
    first authorized client — the manager's, inbox-dev's, an operator key Colin holds?**
 3. **Control bound off-box** — the tcp listener on a reachable interface:port
    (only safe *because* of the auth above; never expose unauthenticated).
+
+## Security invariants (load-bearing)
+
+- **`authorized_keys` ⇒ `server_tls` is a required invariant.** The guest *infers* an
+  encrypted channel from the `upgrade-to-tls-server` result (Ok = we upgraded; "already
+  TLS" = the handler terminated TLS on accept; anything else = refuse + close *before*
+  any auth byte is sent). It cannot yet *positively assert* the channel is TLS — no such
+  tcp query exists (requested from theater-dev; that assertion is the proper long-term
+  fix). So a hand-written manifest that sets `authorized_keys` without `server_tls` must
+  be avoided. The CLI-emitted manifest enforces this (authed requires `--tls-cert`/`--tls-key`);
+  the VPS bootstrap enforces it too. The guest fails closed, so the failure mode is a
+  refused connection, not a plaintext leak.
+- **An authorized key is root-equivalent for the control plane.** Authorizing a client
+  pubkey grants it full `add`/`remove`/`apply`/`restart` authority — i.e. `runtime.spawn`
+  / `stop-actor` over every service this supervisor runs on that box. Treat the allowlist
+  like `~/.ssh/authorized_keys` on a root account: add only keys you'd trust with the box.
 
 ## Reuse vs build — the line
 

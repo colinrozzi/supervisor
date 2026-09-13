@@ -72,6 +72,13 @@ enum Cmd {
         #[command(flatten)]
         conn: ConnArgs,
     },
+    /// Restart a service: stop the current incarnation, spawn a fresh one, and clear
+    /// its crash-loop window (unblocks a tripped breaker).
+    Restart {
+        handle: String,
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
     /// Replace the whole desired roster from a file (the supervisor diffs + reconciles:
     /// stops what's gone, spawns what's new, leaves the rest).
     Apply {
@@ -223,6 +230,7 @@ async fn main() {
         Cmd::List { conn } => control_print(conn, &json_op("list", &[])),
         Cmd::Status { handle, conn } => control_print(conn, &json_op("status", &[("handle", handle)])),
         Cmd::Remove { handle, conn } => control_print(conn, &json_op("remove", &[("handle", handle)])),
+        Cmd::Restart { handle, conn } => control_print(conn, &json_op("restart", &[("handle", handle)])),
         Cmd::Chain { handle, conn } => control_print(conn, &json_op("chain", &[("handle", handle)])),
         Cmd::Add { handle, manifest, max, window_ms, keep_chain, conn } => {
             control_print(conn, &add_op(handle, manifest, *max, *window_ms, *keep_chain))
@@ -264,7 +272,12 @@ fn keygen(out: Option<&str>) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+            eprintln!(
+                "supervisor: WARNING: could not chmod 600 {} ({e}) — the private key may be world-readable; fix its permissions manually",
+                path.display()
+            );
+        }
     }
     println!("private key written to {}", path.display());
     println!("public key (add to control.authorized_keys):\n{pubkey_hex}");
