@@ -7,6 +7,8 @@
 //!   --logs                    theater's own runtime logs (the host's internals)
 //! `--manifest <m.toml>` spawns a ready manifest raw instead.
 
+mod client;
+
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -40,26 +42,77 @@ enum Cmd {
     /// print its chain and/or the runtime's logs.
     Spawn(SpawnArgs),
     /// List the roster of a running supervisor (via its control port).
-    List { #[arg(long, default_value = "9000")] port: u16 },
+    List {
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
     /// Show one service's spec + status.
-    Status { handle: String, #[arg(long, default_value = "9000")] port: u16 },
+    Status {
+        handle: String,
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
     /// Add a service to a running supervisor's desired roster (it reconciles).
     Add {
         handle: String,
         manifest: String,
-        #[arg(long, default_value = "9000")] port: u16,
-        #[arg(long)] max: Option<u32>,
-        #[arg(long)] window_ms: Option<u64>,
+        #[arg(long)]
+        max: Option<u32>,
+        #[arg(long)]
+        window_ms: Option<u64>,
         /// Keep the child's chain in memory (queryable with `chain`).
-        #[arg(long)] keep_chain: bool,
+        #[arg(long)]
+        keep_chain: bool,
+        #[command(flatten)]
+        conn: ConnArgs,
     },
     /// Remove a service (the supervisor stops it).
-    Remove { handle: String, #[arg(long, default_value = "9000")] port: u16 },
+    Remove {
+        handle: String,
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
     /// Replace the whole desired roster from a file (the supervisor diffs + reconciles:
     /// stops what's gone, spawns what's new, leaves the rest).
-    Apply { roster: String, #[arg(long, default_value = "9000")] port: u16 },
+    Apply {
+        roster: String,
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
     /// Dump a service's in-memory chain (needs record or keep_chain).
-    Chain { handle: String, #[arg(long, default_value = "9000")] port: u16 },
+    Chain {
+        handle: String,
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+    /// Generate an ed25519 client identity keypair. Writes the private key to <OUT>
+    /// (chmod 600) and prints the public key hex — add that to the supervisor's
+    /// `control.authorized_keys` to authorize this client.
+    Keygen {
+        /// Where to write the private key (default ~/.config/supervisor/keys/id_ed25519).
+        #[arg(long)]
+        out: Option<String>,
+    },
+}
+
+/// How to reach a supervisor's control surface. `--profile` (authenticated TLS) takes
+/// precedence; otherwise plaintext `--host`/`--port` (local dev).
+#[derive(Parser)]
+struct ConnArgs {
+    /// Connect via this profile from ~/.config/supervisor/config (TLS + ed25519 auth).
+    #[arg(long)]
+    profile: Option<String>,
+    /// Plaintext host (unauth, local). Default 127.0.0.1. Ignored when --profile is set.
+    #[arg(long)]
+    host: Option<String>,
+    /// Control port (plaintext mode). Default 9000. Ignored when --profile is set.
+    #[arg(long, default_value = "9000")]
+    port: u16,
+}
+impl ConnArgs {
+    fn target(&self) -> Result<client::Target> {
+        client::resolve_target(self.profile.as_deref(), self.host.as_deref(), self.port)
+    }
 }
 
 #[derive(Parser)]
@@ -101,6 +154,22 @@ struct SpawnArgs {
     /// Print the generated manifest to stderr before spawning (roster mode).
     #[arg(long)]
     show_manifest: bool,
+
+    /// Server TLS certificate (PEM) for an AUTHENTICATED control surface. Requires
+    /// --tls-key and at least one --authorized-key. Hand this cert to clients to pin.
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<String>,
+    /// Server TLS private key (PEM). Pairs with --tls-cert.
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<String>,
+    /// An ed25519 client pubkey (hex) allowed to drive the control surface. Repeatable.
+    /// When present, the control surface requires TLS + ed25519 auth.
+    #[arg(long = "authorized-key", value_name = "HEX")]
+    authorized_key: Vec<String>,
+    /// Interface for the control listener. Default 127.0.0.1; set 0.0.0.0 for off-box
+    /// (only meaningful with --authorized-key).
+    #[arg(long)]
+    control_bind: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -133,6 +202,11 @@ impl LogLevel {
 
 #[tokio::main]
 async fn main() {
+    // Install the process-level rustls CryptoProvider (ring) once, up front. Both our
+    // control client AND the embedded theater tcp handler's server-side TLS resolve the
+    // provider from this global; without it, `upgrade-to-tls-server` panics.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
     let res = match &cli.cmd {
         Cmd::Spawn(args) => {
@@ -146,14 +220,15 @@ async fn main() {
                 .init();
             spawn(args).await
         }
-        Cmd::List { port } => control_print(*port, &json_op("list", &[])),
-        Cmd::Status { handle, port } => control_print(*port, &json_op("status", &[("handle", handle)])),
-        Cmd::Remove { handle, port } => control_print(*port, &json_op("remove", &[("handle", handle)])),
-        Cmd::Chain { handle, port } => control_print(*port, &json_op("chain", &[("handle", handle)])),
-        Cmd::Add { handle, manifest, port, max, window_ms, keep_chain } => {
-            control_print(*port, &add_op(handle, manifest, *max, *window_ms, *keep_chain))
+        Cmd::List { conn } => control_print(conn, &json_op("list", &[])),
+        Cmd::Status { handle, conn } => control_print(conn, &json_op("status", &[("handle", handle)])),
+        Cmd::Remove { handle, conn } => control_print(conn, &json_op("remove", &[("handle", handle)])),
+        Cmd::Chain { handle, conn } => control_print(conn, &json_op("chain", &[("handle", handle)])),
+        Cmd::Add { handle, manifest, max, window_ms, keep_chain, conn } => {
+            control_print(conn, &add_op(handle, manifest, *max, *window_ms, *keep_chain))
         }
-        Cmd::Apply { roster, port } => apply_op(roster).and_then(|op| control_print(*port, &op)),
+        Cmd::Apply { roster, conn } => apply_op(roster).and_then(|op| control_print(conn, &op)),
+        Cmd::Keygen { out } => keygen(out.as_deref()),
     };
     if let Err(e) = res {
         eprintln!("supervisor: {e:#}");
@@ -161,17 +236,38 @@ async fn main() {
     }
 }
 
-/// Send one JSON op to a running supervisor's control port and print the reply.
-fn control_print(port: u16, op_json: &str) -> Result<()> {
-    use std::io::{Read, Write};
-    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
-        .with_context(|| format!("connecting to supervisor control port {port}"))?;
-    stream.write_all(op_json.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
-    let mut resp = Vec::new();
-    stream.read_to_end(&mut resp)?; // server replies then closes
-    println!("{}", String::from_utf8_lossy(&resp).trim());
+/// Resolve the connection target, send one JSON op, and print the reply.
+fn control_print(conn: &ConnArgs, op_json: &str) -> Result<()> {
+    let target = conn.target()?;
+    let reply = client::control_send(&target, op_json)?;
+    println!("{reply}");
+    Ok(())
+}
+
+/// Generate + persist a client identity keypair; print the pubkey to authorize.
+fn keygen(out: Option<&str>) -> Result<()> {
+    let path = match out {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            std::path::PathBuf::from(home).join(".config/supervisor/keys/id_ed25519")
+        }
+    };
+    if path.exists() {
+        return Err(anyhow!("{} already exists — refusing to overwrite", path.display()));
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let (seed_hex, pubkey_hex) = client::generate_identity();
+    std::fs::write(&path, &seed_hex).with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    println!("private key written to {}", path.display());
+    println!("public key (add to control.authorized_keys):\n{pubkey_hex}");
     Ok(())
 }
 
@@ -235,7 +331,19 @@ fn load_manifest(args: &SpawnArgs) -> Result<(ManifestConfig, std::path::PathBuf
             .ok_or_else(|| anyhow!("give a roster file, or --manifest <path>"))?;
         let roster = std::fs::read_to_string(roster_path)
             .with_context(|| format!("reading roster {roster_path}"))?;
-        let toml = generate_manifest(&roster, args.wasm.as_deref(), args.record_dir.as_deref(), args.control_port)?;
+        let tls = match (&args.tls_cert, &args.tls_key) {
+            (Some(c), Some(k)) => Some((c.as_str(), k.as_str())),
+            _ => None,
+        };
+        let toml = generate_manifest(GenManifest {
+            roster: &roster,
+            wasm: args.wasm.as_deref(),
+            record_dir: args.record_dir.as_deref(),
+            control_port: args.control_port,
+            control_bind: args.control_bind.as_deref(),
+            authorized_keys: &args.authorized_key,
+            tls,
+        })?;
         if args.show_manifest {
             eprintln!("--- generated manifest ---\n{toml}\n--------------------------");
         }
@@ -245,16 +353,44 @@ fn load_manifest(args: &SpawnArgs) -> Result<(ManifestConfig, std::path::PathBuf
     }
 }
 
+/// Args for `generate_manifest` — the roster + the handler/permission knobs.
+struct GenManifest<'a> {
+    roster: &'a str,
+    wasm: Option<&'a str>,
+    record_dir: Option<&'a str>,
+    control_port: Option<u16>,
+    control_bind: Option<&'a str>,
+    authorized_keys: &'a [String],
+    /// (cert PEM path, key PEM path) → enables server TLS on the tcp handler.
+    tls: Option<(&'a str, &'a str)>,
+}
+
 /// Build a supervisor manifest TOML around a roster: package = supervisor.wasm,
 /// initial_state = the (compacted) roster, and the handlers + permission grants the
-/// supervisor needs — http-client / filesystem only when a service records to them.
-fn generate_manifest(roster: &str, wasm: Option<&str>, record_dir: Option<&str>, control_port: Option<u16>) -> Result<String> {
+/// supervisor needs — http-client / filesystem only when a service records to them,
+/// server TLS + authorized_keys when the control surface is authenticated.
+fn generate_manifest(g: GenManifest<'_>) -> Result<String> {
+    let GenManifest { roster, wasm, record_dir, control_port, control_bind, authorized_keys, tls } = g;
+    if !authorized_keys.is_empty() && control_port.is_none() {
+        return Err(anyhow!("--authorized-key needs the control surface — pass --control-port"));
+    }
+    if !authorized_keys.is_empty() && tls.is_none() {
+        return Err(anyhow!("--authorized-key requires TLS — pass --tls-cert and --tls-key"));
+    }
     let mut parsed: serde_json::Value =
         serde_json::from_str(roster).context("roster is not valid JSON")?;
-    // Inject the control port into the roster's init config (opt-in).
+    // Inject the control config into the roster's init state (opt-in): port + optional
+    // bind + optional authorized_keys (which flips the surface to TLS + ed25519 auth).
     if let Some(p) = control_port {
         if let Some(obj) = parsed.as_object_mut() {
-            obj.insert("control".into(), serde_json::json!({ "port": p }));
+            let mut control = serde_json::json!({ "port": p });
+            if let Some(bind) = control_bind {
+                control["bind"] = serde_json::json!(bind);
+            }
+            if !authorized_keys.is_empty() {
+                control["authorized_keys"] = serde_json::json!(authorized_keys);
+            }
+            obj.insert("control".into(), control);
         }
     }
     let mut http_hosts: Vec<String> = Vec::new();
@@ -313,7 +449,19 @@ fn generate_manifest(roster: &str, wasm: Option<&str>, record_dir: Option<&str>,
         m.push_str(&format!("[[handler]]\ntype = \"{h}\"\n\n"));
     }
     if control_port.is_some() {
-        m.push_str("[[handler]]\ntype = \"tcp\"\n\n");
+        m.push_str("[[handler]]\ntype = \"tcp\"\n");
+        if let Some((cert, key)) = tls {
+            let cert_abs = std::fs::canonicalize(cert)
+                .with_context(|| format!("--tls-cert {cert} not found"))?;
+            let key_abs = std::fs::canonicalize(key)
+                .with_context(|| format!("--tls-key {key} not found"))?;
+            m.push_str(&format!(
+                "server_tls = {{ enabled = true, cert = \"{}\", key = \"{}\" }}\n",
+                cert_abs.display(),
+                key_abs.display()
+            ));
+        }
+        m.push('\n');
     }
     if !http_hosts.is_empty() {
         let hosts = http_hosts.iter().map(|h| format!("\"{h}\"")).collect::<Vec<_>>().join(", ");

@@ -15,6 +15,9 @@ packr-abi = { version = "0.24.1", default-features = false }
 theater-guest = { git = "https://github.com/colinrozzi/theater", rev = "cfcd737606758d388ab9d7042932d13e8da23a76" }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
+# Client auth (verify-only, deterministic — no getrandom on wasm; spike-validated).
+ed25519-dalek = { version = "2", default-features = false }
+sha2 = { version = "0.10", default-features = false }
 
 [profile.release]
 opt-level = "s"

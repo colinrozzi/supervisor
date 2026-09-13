@@ -95,6 +95,7 @@ pack_types! {
             receive: func(connection-id: string, max-bytes: u32) -> result<list<u8>, string>,
             send: func(connection-id: string, data: list<u8>) -> result<u64, string>,
             close: func(connection-id: string) -> result<_, string>,
+            upgrade-to-tls-server: func(connection-id: string) -> result<_, string>,
         }
         theater:simple/lifecycle {
             monitor: func(subject: string) -> result<_, string>,
@@ -148,6 +149,11 @@ fn tcp_receive(conn: String, max_bytes: u32) -> Result<Vec<u8>, String>;
 fn tcp_send(conn: String, data: Vec<u8>) -> Result<u64, String>;
 #[import(module = "theater:simple/tcp", name = "close")]
 fn tcp_close(conn: String) -> Result<(), String>;
+// STARTTLS-style upgrade: after this returns Ok, send/receive on the same conn flow over
+// TLS (rustls, host-side via the tcp handler's server_tls cert/key). The guest does no
+// transport crypto — encryption is terminated in the handler.
+#[import(module = "theater:simple/tcp", name = "upgrade-to-tls-server")]
+fn tcp_upgrade_to_tls_server(conn: String) -> Result<(), String>;
 
 // runtime.stop-actor -> result<_, runtime-error>; raw + parse like spawn.
 #[import(module = "theater:simple/runtime", name = "stop-actor")]
@@ -197,6 +203,64 @@ fn hex(bytes: &[u8]) -> String {
         s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
     }
     s
+}
+
+/// Parse lowercase/uppercase hex into bytes; None on odd length or non-hex.
+fn from_hex(s: &str) -> Option<Vec<u8>> {
+    let s = s.as_bytes();
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let nib = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut i = 0;
+    while i < s.len() {
+        out.push((nib(s[i])? << 4) | nib(s[i + 1])?);
+        i += 2;
+    }
+    Some(out)
+}
+
+/// Build a 32-byte challenge nonce for this connection: SHA-256 over the monotonic
+/// timer + the connection id + a counter. Unique per connection; over TLS this is
+/// sufficient to bind each auth signature to a distinct session (see docs/remote-management.md
+/// for the freshness rationale — a crypto-grade `random` handler can replace this later).
+fn make_nonce(conn: &str, counter: u64) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(timer_now().to_le_bytes());
+    h.update(counter.to_le_bytes());
+    h.update(conn.as_bytes());
+    let out = h.finalize();
+    let mut n = [0u8; 32];
+    n.copy_from_slice(&out);
+    n
+}
+
+/// Verify an ed25519 signature over `nonce` by the key `pubkey_hex`, requiring that key
+/// be in `authorized`. Deterministic (no RNG) — the only guest-side crypto op. Returns the
+/// authorized pubkey hex on success (for logging), or an error reason.
+fn verify_auth(authorized: &[String], pubkey_hex: &str, nonce: &[u8], sig_hex: &str) -> Result<String, String> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    // Constant set membership is fine here (small allowlist); exact hex match.
+    let pubkey_lc = pubkey_hex.to_lowercase();
+    if !authorized.iter().any(|k| k.to_lowercase() == pubkey_lc) {
+        return Err(String::from("unauthorized key"));
+    }
+    let pk_bytes = from_hex(pubkey_hex).ok_or_else(|| String::from("bad pubkey hex"))?;
+    let pk_arr: [u8; 32] = pk_bytes.as_slice().try_into().map_err(|_| String::from("pubkey must be 32 bytes"))?;
+    let vk = VerifyingKey::from_bytes(&pk_arr).map_err(|_| String::from("invalid pubkey"))?;
+    let sig_bytes = from_hex(sig_hex).ok_or_else(|| String::from("bad sig hex"))?;
+    let sig = Signature::from_slice(&sig_bytes).map_err(|_| String::from("sig must be 64 bytes"))?;
+    vk.verify(nonce, &sig).map_err(|_| String::from("signature mismatch"))?;
+    Ok(pubkey_lc)
 }
 
 /// Minimal JSON string escaping (quotes + backslashes + control) for the small,
@@ -363,6 +427,16 @@ struct Config {
 #[derive(Deserialize)]
 struct ControlCfg {
     port: u16,
+    /// Interface to bind. Default 127.0.0.1 (local dev). Set to 0.0.0.0 (or a specific
+    /// interface) for off-box control — ONLY meaningful together with `authorized_keys`.
+    #[serde(default)]
+    bind: Option<String>,
+    /// ed25519 client pubkeys (hex) allowed to drive the control surface. When non-empty,
+    /// the control surface is AUTHENTICATED: each connection is TLS-upgraded then must pass
+    /// an ed25519 challenge-response before any op. Empty/absent = legacy localhost plaintext
+    /// (local dev via `supervisor spawn --control-port`).
+    #[serde(default)]
+    authorized_keys: Option<Vec<String>>,
 }
 #[derive(Deserialize)]
 struct ServiceCfg {
@@ -403,6 +477,11 @@ impl RecordCfg {
 #[derive(Clone, GraphValue, State)]
 struct SupervisorState {
     services: Vec<Svc>,
+    /// Authorized client ed25519 pubkeys (hex). Non-empty ⇒ control surface requires
+    /// TLS + ed25519 auth. Empty ⇒ legacy localhost plaintext (local dev).
+    authorized_keys: Vec<String>,
+    /// Monotonic counter mixed into per-connection challenge nonces.
+    nonce_counter: u64,
 }
 /// Where a recording service's chain events go.
 #[derive(Clone, GraphValue)]
@@ -529,16 +608,29 @@ fn init(config: Value) -> Value {
         }
     }
     log(format!("[supervisor] roster up: {} service(s)", services.len()));
-    SupervisorState::set(SupervisorState { services });
 
     // Opt-in control surface: listen for live roster edits (JSON over TCP).
+    let mut authorized_keys: Vec<String> = Vec::new();
     if let Some(control) = cfg.control {
-        let addr = format!("127.0.0.1:{}", control.port);
+        authorized_keys = control.authorized_keys.unwrap_or_default();
+        let bind = control.bind.as_deref().unwrap_or("127.0.0.1");
+        let addr = format!("{}:{}", bind, control.port);
         match tcp_listen(addr.clone()) {
-            Ok(_listener) => log(format!("[supervisor] control surface listening on {}", addr)),
+            Ok(_listener) => {
+                let mode = if authorized_keys.is_empty() {
+                    String::from("PLAINTEXT (localhost dev — no auth)")
+                } else {
+                    format!("TLS + ed25519 auth ({} authorized key(s))", authorized_keys.len())
+                };
+                log(format!("[supervisor] control surface listening on {} — {}", addr, mode));
+                if !authorized_keys.is_empty() && bind == "127.0.0.1" {
+                    log(String::from("[supervisor] note: authorized_keys set but bound to 127.0.0.1 — set control.bind for off-box access"));
+                }
+            }
             Err(e) => log(format!("[supervisor] control listen on {} failed: {}", addr, e)),
         }
     }
+    SupervisorState::set(SupervisorState { services, authorized_keys, nonce_counter: 0 });
     ok_unit()
 }
 
@@ -664,6 +756,53 @@ fn handle_actor_event(input: Value) -> Value {
 
 // ---- control surface (JSON over TCP) ---------------------------------------
 
+/// Reads '\n'-delimited lines off a connection, buffering across `receive` calls so a
+/// pipelined auth-line + op-line don't get lost. `receive` blocks until data/EOF.
+struct LineReader {
+    conn: String,
+    buf: Vec<u8>,
+}
+impl LineReader {
+    fn new(conn: String) -> Self {
+        Self { conn, buf: Vec::new() }
+    }
+    /// Next line (newline + trailing CR stripped). None on EOF with nothing buffered.
+    fn next_line(&mut self) -> Option<Vec<u8>> {
+        loop {
+            if let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
+                let mut line: Vec<u8> = self.buf.drain(..=pos).collect();
+                line.pop(); // '\n'
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                return Some(line);
+            }
+            match tcp_receive(self.conn.clone(), 4096) {
+                Ok(chunk) if chunk.is_empty() => {
+                    if self.buf.is_empty() {
+                        return None;
+                    }
+                    return Some(core::mem::take(&mut self.buf));
+                }
+                Ok(chunk) => {
+                    self.buf.extend_from_slice(&chunk);
+                    if self.buf.len() > 65536 {
+                        return Some(core::mem::take(&mut self.buf)); // cap
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
+/// Client auth response: an ed25519 pubkey + a signature over the server's nonce (both hex).
+#[derive(Deserialize)]
+struct AuthMsg {
+    pubkey: String,
+    sig: String,
+}
+
 #[export(name = "theater:simple/tcp-client.handle-connection")]
 fn handle_connection(input: Value) -> Value {
     let conn = match &input {
@@ -678,26 +817,62 @@ fn handle_connection(input: Value) -> Value {
         log(format!("[supervisor] control activate failed: {}", e));
         return ok_unit();
     }
-    // Read a newline-terminated JSON request (receive blocks until data/EOF).
-    let mut buf: Vec<u8> = Vec::new();
-    loop {
-        match tcp_receive(conn.clone(), 4096) {
-            Ok(chunk) if chunk.is_empty() => break, // EOF
-            Ok(chunk) => {
-                buf.extend_from_slice(&chunk);
-                if buf.contains(&b'\n') || buf.len() > 65536 {
-                    break;
-                }
-            }
+
+    let authorized = SupervisorState::with_mut(|st| st.authorized_keys.clone());
+    let mut reader = LineReader::new(conn.clone());
+
+    // Authenticated path: ensure TLS, then an ed25519 challenge-response, before any op.
+    if !authorized.is_empty() {
+        // The tcp handler auto-terminates TLS on accept when server_tls.enabled=true, so the
+        // connection may already be encrypted; otherwise this performs a STARTTLS-style upgrade.
+        // Either way we require an encrypted channel before the handshake.
+        match tcp_upgrade_to_tls_server(conn.clone()) {
+            Ok(()) => {}
+            Err(e) if e.contains("already TLS") => {} // handler already terminated TLS
             Err(e) => {
-                log(format!("[supervisor] control receive failed: {}", e));
+                log(format!("[supervisor] control TLS upgrade failed: {}", e));
                 let _ = tcp_close(conn);
                 return ok_unit();
             }
         }
+        // Fresh per-connection nonce → send as the challenge.
+        let nonce = SupervisorState::with_mut(|st| {
+            let c = st.nonce_counter;
+            st.nonce_counter = st.nonce_counter.wrapping_add(1);
+            make_nonce(&conn, c)
+        });
+        let challenge = format!("{{\"nonce\":\"{}\"}}\n", hex(&nonce));
+        if tcp_send(conn.clone(), challenge.into_bytes()).is_err() {
+            let _ = tcp_close(conn);
+            return ok_unit();
+        }
+        // Read + verify the client's signed response.
+        let auth_line = match reader.next_line() {
+            Some(l) => l,
+            None => {
+                let _ = tcp_close(conn);
+                return ok_unit();
+            }
+        };
+        let reject = |conn: String, why: String| -> Value {
+            log(format!("[supervisor] control: AUTH REJECTED ({})", why));
+            let _ = tcp_send(conn.clone(), format!("{}\n", err_reply(&format!("auth failed: {}", why))).into_bytes());
+            let _ = tcp_close(conn);
+            ok_unit()
+        };
+        let msg: AuthMsg = match serde_json::from_slice(&auth_line) {
+            Ok(m) => m,
+            Err(_) => return reject(conn, String::from("malformed auth message")),
+        };
+        match verify_auth(&authorized, &msg.pubkey, &nonce, &msg.sig) {
+            Ok(who) => log(format!("[supervisor] control: authenticated key {}…", &who[..16.min(who.len())])),
+            Err(e) => return reject(conn, e),
+        }
     }
-    let line: &[u8] = buf.split(|b| *b == b'\n').next().unwrap_or(&[]);
-    let mut reply = handle_op(line).into_bytes();
+
+    // Op line (authenticated, or legacy plaintext localhost).
+    let op_line = reader.next_line().unwrap_or_default();
+    let mut reply = handle_op(&op_line).into_bytes();
     reply.push(b'\n');
     let _ = tcp_send(conn.clone(), reply);
     let _ = tcp_close(conn);
