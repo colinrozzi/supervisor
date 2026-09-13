@@ -8,11 +8,11 @@ description = "Theater's reconciler: spawn + manage a declared roster of service
 crate-type = ["cdylib"]
 
 # Fleet baseline (post engine-axis overhaul): packr-guest 0.24 + theater-guest.
-# Pinned to theater @ 82cc6217 (post-#209: reqwest rustls — no openssl in any theater build).
+# Pinned to theater @ cfcd7376 (final inbox+supervisor cutover rev; #204-#209 + #211).
 [dependencies]
 packr-guest = { version = "0.24.1", features = ["derive"] }
 packr-abi = { version = "0.24.1", default-features = false }
-theater-guest = { git = "https://github.com/colinrozzi/theater", rev = "82cc6217fcd5d4288e4c7aea5602197630e7dde3" }
+theater-guest = { git = "https://github.com/colinrozzi/theater", rev = "cfcd737606758d388ab9d7042932d13e8da23a76" }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 
