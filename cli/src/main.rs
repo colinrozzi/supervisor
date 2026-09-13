@@ -100,6 +100,48 @@ enum Cmd {
         #[arg(long)]
         out: Option<String>,
     },
+    /// Update this `supervisor` binary in place from the latest GitHub release
+    /// (download → checksum-verify → atomic replace).
+    Upgrade {
+        /// Install directory (default ~/.local/bin).
+        #[arg(long)]
+        install_dir: Option<String>,
+    },
+    /// One-time setup for an AUTHENTICATED supervisor on this box: generate a self-signed
+    /// server TLS cert+key (no openssl needed), seed the authorized client keys, and emit
+    /// the run command + a systemd unit.
+    Bootstrap(BootstrapArgs),
+}
+
+#[derive(Parser)]
+struct BootstrapArgs {
+    /// Output directory for cert/key/run.sh/unit.
+    #[arg(long)]
+    out: String,
+    /// Hostname clients connect to (cert CN + SAN).
+    #[arg(long)]
+    host: String,
+    /// Roster JSON (the acceptor services the supervisor runs).
+    #[arg(long)]
+    roster: String,
+    /// An authorized client ed25519 pubkey (hex). Repeatable. At least one required.
+    #[arg(long = "authorized-key", value_name = "HEX", required = true)]
+    authorized_key: Vec<String>,
+    /// Control port. Default 9000.
+    #[arg(long, default_value = "9000")]
+    port: u16,
+    /// Listener interface. Default 0.0.0.0 (off-box).
+    #[arg(long, default_value = "0.0.0.0")]
+    bind: String,
+    /// Optional IP SAN for the cert.
+    #[arg(long)]
+    ip: Option<String>,
+    /// systemd unit name. Default "supervisor".
+    #[arg(long, default_value = "supervisor")]
+    unit_name: String,
+    /// Path to the supervisor binary the unit runs (default: this binary).
+    #[arg(long)]
+    supervisor_bin: Option<String>,
 }
 
 /// How to reach a supervisor's control surface. `--profile` (authenticated TLS) takes
@@ -237,6 +279,8 @@ async fn main() {
         }
         Cmd::Apply { roster, conn } => apply_op(roster).and_then(|op| control_print(conn, &op)),
         Cmd::Keygen { out } => keygen(out.as_deref()),
+        Cmd::Upgrade { install_dir } => upgrade(install_dir.as_deref()),
+        Cmd::Bootstrap(args) => bootstrap(args),
     };
     if let Err(e) = res {
         eprintln!("supervisor: {e:#}");
@@ -281,6 +325,122 @@ fn keygen(out: Option<&str>) -> Result<()> {
     }
     println!("private key written to {}", path.display());
     println!("public key (add to control.authorized_keys):\n{pubkey_hex}");
+    Ok(())
+}
+
+/// Self-update this binary (+ the sidecar wasm) from the latest GitHub release.
+fn upgrade(install_dir: Option<&str>) -> Result<()> {
+    let dir = match install_dir {
+        Some(d) => std::path::PathBuf::from(d),
+        None => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            std::path::PathBuf::from(home).join(".local/bin")
+        }
+    };
+    let cfg = fleet_release::UpgradeConfig::new(
+        "colinrozzi/supervisor",
+        "supervisor",
+        &["supervisor", "supervisor.wasm"],
+        dir,
+    );
+    fleet_release::upgrade(&cfg)?;
+    Ok(())
+}
+
+/// Generate a self-signed cert (host + optional IP SAN); returns (cert_pem, key_pem).
+fn gen_self_signed(host: &str, ip: Option<&str>) -> Result<(String, String)> {
+    let mut sans = vec![host.to_string()];
+    if let Some(ip) = ip {
+        sans.push(ip.to_string());
+    }
+    let ck = rcgen::generate_simple_self_signed(sans).context("generating self-signed cert")?;
+    Ok((ck.cert.pem(), ck.key_pair.serialize_pem()))
+}
+
+/// One-time authenticated-supervisor setup: cert + authorized keys + run script + unit.
+fn bootstrap(a: &BootstrapArgs) -> Result<()> {
+    let out = std::path::PathBuf::from(&a.out);
+    std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
+
+    // Sanity-check the roster is JSON before we commit to anything.
+    let roster_txt = std::fs::read_to_string(&a.roster)
+        .with_context(|| format!("reading roster {}", a.roster))?;
+    let _: serde_json::Value =
+        serde_json::from_str(&roster_txt).context("roster is not valid JSON")?;
+    let roster_abs = std::fs::canonicalize(&a.roster)?;
+
+    // Self-signed server cert+key (native — no openssl on the box).
+    let cert_path = out.join("server-cert.pem");
+    let key_path = out.join("server-key.pem");
+    if !cert_path.exists() || !key_path.exists() {
+        let (cert_pem, key_pem) = gen_self_signed(&a.host, a.ip.as_deref())?;
+        std::fs::write(&cert_path, cert_pem)?;
+        std::fs::write(&key_path, key_pem)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)) {
+                eprintln!("supervisor: WARNING: could not chmod 600 {} ({e})", key_path.display());
+            }
+        }
+        println!("generated server cert: {} (distribute to clients to pin)", cert_path.display());
+        println!("generated server key : {} (chmod 600; keep on this box)", key_path.display());
+    } else {
+        println!("reusing existing cert/key in {} (delete to regenerate)", out.display());
+    }
+
+    let sup = a.supervisor_bin.clone().unwrap_or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_else(|| "supervisor".into())
+    });
+
+    // run.sh — the exact authenticated spawn invocation.
+    let key_flags: String = a
+        .authorized_key
+        .iter()
+        .map(|k| format!("--authorized-key {k} "))
+        .collect();
+    let run_path = out.join("run.sh");
+    let run = format!(
+        "#!/usr/bin/env bash\n# Runs the authenticated supervisor. Generated by `supervisor bootstrap`.\nexec \"{sup}\" spawn \"{roster}\" \\\n  --control-port {port} --control-bind {bind} \\\n  --tls-cert \"{cert}\" --tls-key \"{key}\" \\\n  {keys}\\\n  --logs warn\n",
+        sup = sup,
+        roster = roster_abs.display(),
+        port = a.port,
+        bind = a.bind,
+        cert = cert_path.display(),
+        key = key_path.display(),
+        keys = key_flags,
+    );
+    std::fs::write(&run_path, run)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&run_path, std::fs::Permissions::from_mode(0o755));
+    }
+    println!("wrote run script: {}", run_path.display());
+
+    // systemd unit.
+    let unit_path = out.join(format!("{}.service", a.unit_name));
+    let unit = format!(
+        "[Unit]\nDescription=supervisor ({unit}) — authenticated reconciler + host for the supervised tree\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={run}\nRestart=always\nRestartSec=2\n# systemd stop/restart sends SIGTERM → the supervisor hard-kills the tree, then respawns\n# on restart (correct for wedge remediation; not a graceful drain — supervisor task #15).\n# Point any liveness watchdog at THIS unit.\n\n[Install]\nWantedBy=multi-user.target\n",
+        unit = a.unit_name,
+        run = run_path.display(),
+    );
+    std::fs::write(&unit_path, unit)?;
+    println!("wrote systemd unit: {}", unit_path.display());
+
+    println!("\nnext:");
+    println!("  1. install:   cp {} /etc/systemd/system/ && systemctl daemon-reload", unit_path.display());
+    println!("  2. start:     systemctl enable --now {}", a.unit_name);
+    println!("  3. distribute {} to each authorized client; they set server_cert=<that path>,", cert_path.display());
+    println!("     host={}, port={}, identity=<their `supervisor keygen` key> in ~/.config/supervisor/config", a.host, a.port);
+    println!("  4. verify:    supervisor list --profile <name>");
+    println!("\nauthorized keys seeded ({}):", a.authorized_key.len());
+    for k in &a.authorized_key {
+        println!("  - {k}");
+    }
     Ok(())
 }
 

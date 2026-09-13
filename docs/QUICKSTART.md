@@ -22,6 +22,12 @@ supervisor --help
 (Or one-shot, if `gh` is authed: `gh release download --repo colinrozzi/supervisor
 --pattern supervisor -O ~/.local/bin/supervisor && chmod +x ~/.local/bin/supervisor`.)
 
+After the first install, the binary self-updates — no wrapper needed:
+
+```sh
+supervisor upgrade            # download + checksum-verify + atomic-replace from the latest release
+```
+
 ## 2. Write a roster
 
 JSON — one entry per actor you want kept alive. `manifest` is a path or an
