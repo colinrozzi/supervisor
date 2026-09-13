@@ -74,9 +74,20 @@ server_cert = "~/.config/supervisor/known/prod-inbox.pem"  # pinned server cert
 resolves the profile, TLS-connects (pinning `server_cert`), runs the ed25519
 handshake with `identity`, then speaks the existing JSON control protocol.
 
-## Bootstrap contract (the manager runs this once, on the VPS)
+## Bootstrap (the manager runs this once, on the VPS)
 
-Someone has to land the first supervisor process; after that, management is remote.
+`dist/supervisor-bootstrap` automates it: generates the self-signed server cert+key,
+seeds the authorized client pubkeys, and emits the `supervisor spawn` run script + a
+systemd unit. Each client first runs `supervisor keygen` and sends their PUBLIC key.
+
+```sh
+supervisor-bootstrap --out /etc/supervisor --host mail.example.com \
+  --roster /etc/supervisor/roster.json \
+  --authorized-key <inbox-dev-pub> --authorized-key <manager-pub> --authorized-key <operator-pub> \
+  --bind 0.0.0.0 --port 9000
+# → server-cert.pem (distribute to clients to pin), server-key.pem, run.sh, supervisor.service
+```
+
 Bootstrap provisions:
 
 1. **Server TLS cert+key** — self-signed, generated on the box (openssl/rcgen).
