@@ -76,17 +76,21 @@ handshake with `identity`, then speaks the existing JSON control protocol.
 
 ## Bootstrap (the manager runs this once, on the VPS)
 
-`dist/supervisor-bootstrap` automates it: generates the self-signed server cert+key,
-seeds the authorized client pubkeys, and emits the `supervisor spawn` run script + a
-systemd unit. Each client first runs `supervisor keygen` and sends their PUBLIC key.
+`supervisor bootstrap` (a subcommand, v0.3.0+) automates it: generates the self-signed
+server cert+key **natively** (rcgen — no openssl on the box), seeds the authorized client
+pubkeys, and emits the `supervisor spawn` run script + a systemd unit. Each client first
+runs `supervisor keygen` and sends their PUBLIC key.
 
 ```sh
-supervisor-bootstrap --out /etc/supervisor --host mail.example.com \
+supervisor bootstrap --out /etc/supervisor --host mail.example.com \
   --roster /etc/supervisor/roster.json \
   --authorized-key <inbox-dev-pub> --authorized-key <manager-pub> --authorized-key <operator-pub> \
   --bind 0.0.0.0 --port 9000
 # → server-cert.pem (distribute to clients to pin), server-key.pem, run.sh, supervisor.service
 ```
+
+(The `dist/supervisor-bootstrap` bash script is the pre-v0.3.0 equivalent — kept for
+compatibility with older binaries; it needs openssl. Prefer the subcommand.)
 
 Bootstrap provisions:
 

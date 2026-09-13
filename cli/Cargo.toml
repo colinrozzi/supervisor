@@ -28,3 +28,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# `supervisor upgrade` — shared self-update logic (repo/bin parameterized).
+fleet-release = { path = "../fleet-release" }
+# `supervisor bootstrap` — native self-signed cert generation (no openssl on the box).
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }

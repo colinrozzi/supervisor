@@ -1,0 +1,12 @@
+[package]
+name = "fleet-release"
+version = "0.1.0"
+edition = "2021"
+description = "Shared self-update logic for fleet CLI tools: download + checksum-verify + atomic-install a GitHub release's assets. Parameterized by repo + binary, so every tool grows a `<tool> upgrade` from one crate."
+
+[dependencies]
+anyhow = "1"
+sha2 = "0.10"
+# Blocking HTTP with rustls (musl-friendly, no openssl). Follows redirects for
+# github.com/<repo>/releases/latest/download/<asset>.
+ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
