@@ -1,0 +1,8 @@
+# Throwaway test fixture: a trivial idle actor for proving spawn/reconcile off-box.
+# package is an http ref so a remote supervisor resolves it with no files on the box.
+name = "noop"
+version = "0.1.0"
+package = "https://raw.githubusercontent.com/colinrozzi/supervisor/main/experiments/noop/noop.wasm"
+
+[[handler]]
+type = "self"
