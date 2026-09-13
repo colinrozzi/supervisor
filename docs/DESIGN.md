@@ -85,8 +85,16 @@ change — v0.1.)
 - **Deploy / hot-swap** — edit a manifest → reconcile (stop-old/spawn-new); a
   dedicated atomic `update-package` (drain + chain-continuity) if zero-downtime is
   needed.
-- **External stall-probe** (host-wedge class) + **off-box notify escalator** (#43)
-  — inherently outside the runtime; carried from sentinel's mesh-supervision spec.
+- **External stall/delivery-probe** (host-wedge class) — a timer-driven health check
+  (e.g. inbox's #69 read-200 + loopback-/send-delivers-2xx) that restarts the tree on N
+  consecutive failures. Catches "alive but not delivering" (the SMTP :25 wedge), which
+  crash-catch structurally can't. **Deferred (Colin, 2026-09-13): this is APPLICATION-LEVEL
+  logic — what "healthy" means is service-specific — not the generic supervisor's concern
+  yet.** So the supervisor is crash-catch-only for now; the inbox cutover ships labeled
+  crash-catch + flight-recorder, NOT wedge-fixed. Revisit when a probe layer is scoped
+  (an app-side health actor, or a supervisor-driven probe via config).
+- **Off-box notify escalator** (#43) — inherently outside the runtime; carried from
+  sentinel's mesh-supervision spec.
 - **A reusable supervisor library** — only if a real second consumer appears.
 
 ## 5. Migration from sentinel
