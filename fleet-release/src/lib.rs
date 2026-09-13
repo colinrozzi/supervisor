@@ -43,7 +43,14 @@ impl UpgradeConfig {
 /// Returns the installed paths. Prints progress to stderr.
 pub fn upgrade(cfg: &UpgradeConfig) -> Result<Vec<PathBuf>> {
     let base = format!("https://github.com/{}/releases/latest/download", cfg.repo);
-    let tmp = std::env::temp_dir().join(format!("fleet-release-{}", cfg.bin_name));
+    // Stage the download INSIDE install_dir so it's on the SAME filesystem — then the
+    // install is a real atomic rename (which is safe over a running binary: the old inode
+    // stays alive for the running process). A temp on a different fs (e.g. /tmp tmpfs vs a
+    // home fs) would force the copy fallback, which ETXTBSYs when replacing the running
+    // binary — i.e. the self-upgrade case would fail. So: create install_dir first.
+    std::fs::create_dir_all(&cfg.install_dir)
+        .with_context(|| format!("creating install dir {}", cfg.install_dir.display()))?;
+    let tmp = cfg.install_dir.join(format!(".fleet-release-tmp-{}", cfg.bin_name));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).with_context(|| format!("creating temp dir {}", tmp.display()))?;
 
@@ -67,9 +74,7 @@ pub fn upgrade(cfg: &UpgradeConfig) -> Result<Vec<PathBuf>> {
         eprintln!("  verified {asset} ({} bytes)", bytes.len());
     }
 
-    // 3. All verified — install atomically.
-    std::fs::create_dir_all(&cfg.install_dir)
-        .with_context(|| format!("creating install dir {}", cfg.install_dir.display()))?;
+    // 3. All verified — install atomically (rename within the same fs).
     let mut installed = Vec::new();
     for asset in &cfg.assets {
         let dest = cfg.install_dir.join(asset);
@@ -82,7 +87,10 @@ pub fn upgrade(cfg: &UpgradeConfig) -> Result<Vec<PathBuf>> {
     Ok(installed)
 }
 
-/// HTTP GET following redirects; returns the body bytes. 32 MiB cap.
+/// HTTP GET following redirects; returns the body bytes. Capped with generous headroom
+/// over a self-contained binary (wasm embedded); an over-cap read is an EXPLICIT error
+/// (not a silent truncation that would later surface as a confusing checksum mismatch).
+const DOWNLOAD_CAP: u64 = 256 * 1024 * 1024;
 fn download(url: &str) -> Result<Vec<u8>> {
     let resp = ureq::get(url)
         .set("User-Agent", "fleet-release")
@@ -90,11 +98,14 @@ fn download(url: &str) -> Result<Vec<u8>> {
         .map_err(|e| anyhow!("GET {url}: {e}"))?;
     let mut buf = Vec::new();
     resp.into_reader()
-        .take(32 * 1024 * 1024)
+        .take(DOWNLOAD_CAP + 1)
         .read_to_end(&mut buf)
         .with_context(|| format!("reading {url}"))?;
     if buf.is_empty() {
         bail!("empty response from {url}");
+    }
+    if buf.len() as u64 > DOWNLOAD_CAP {
+        bail!("{url} exceeds the {}MiB download cap", DOWNLOAD_CAP / 1024 / 1024);
     }
     Ok(buf)
 }
