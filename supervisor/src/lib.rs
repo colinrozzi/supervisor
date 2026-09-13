@@ -96,6 +96,7 @@ pack_types! {
             send: func(connection-id: string, data: list<u8>) -> result<u64, string>,
             close: func(connection-id: string) -> result<_, string>,
             upgrade-to-tls-server: func(connection-id: string) -> result<_, string>,
+            is-tls: func(connection-id: string) -> result<bool, string>,
         }
         theater:simple/lifecycle {
             monitor: func(subject: string) -> result<_, string>,
@@ -154,6 +155,10 @@ fn tcp_close(conn: String) -> Result<(), String>;
 // transport crypto — encryption is terminated in the handler.
 #[import(module = "theater:simple/tcp", name = "upgrade-to-tls-server")]
 fn tcp_upgrade_to_tls_server(conn: String) -> Result<(), String>;
+// Positive encryption assertion (theater #212): reads the LIVE stream variant, so it can't
+// drift from a cached flag. We HARD-require Ok(true) before any auth byte — no inference.
+#[import(module = "theater:simple/tcp", name = "is-tls")]
+fn tcp_is_tls(conn: String) -> Result<bool, String>;
 
 // runtime.stop-actor -> result<_, runtime-error>; raw + parse like spawn.
 #[import(module = "theater:simple/runtime", name = "stop-actor")]
@@ -831,22 +836,18 @@ fn handle_connection(input: Value) -> Value {
 
     // Authenticated path: ensure TLS, then an ed25519 challenge-response, before any op.
     if !authorized.is_empty() {
-        // This is the ENCRYPTION GATE, and it fails CLOSED. The tcp handler auto-terminates
-        // TLS on accept when server_tls.enabled=true (→ "already TLS"); otherwise this performs
-        // a STARTTLS-style upgrade (→ Ok). BOTH outcomes mean the channel is encrypted. ANY other
-        // result — including a manifest that set authorized_keys but forgot server_tls, where the
-        // upgrade has no cert to use — falls through to close, and we return BEFORE sending the
-        // nonce or reading any auth bytes, so nothing sensitive crosses a plaintext channel.
-        //
-        // NOTE: this INFERS encryption from the upgrade result; the guest cannot yet positively
-        // assert "this conn is TLS" (no such tcp query exists — requested from theater-dev). Until
-        // then, `authorized_keys ⇒ server_tls` is a load-bearing manifest invariant (the CLI
-        // enforces it; docs/remote-management.md documents it; the bootstrap enforces it).
-        match tcp_upgrade_to_tls_server(conn.clone()) {
-            Ok(()) => {}
-            Err(e) if e.contains("already TLS") => {} // handler already terminated TLS on accept
-            Err(e) => {
-                log(format!("[supervisor] control refusing unencrypted channel (TLS upgrade: {})", e));
+        // This is the ENCRYPTION GATE, and it fails CLOSED. The tcp handler auto-terminates TLS
+        // on accept when server_tls.enabled=true; otherwise upgrade-to-tls-server performs a
+        // STARTTLS-style upgrade. We attempt the upgrade (STARTTLS path), then POSITIVELY ASSERT
+        // the channel is encrypted via is-tls (#212, reads the live stream variant — no inference,
+        // no brittle error-text match). We require Ok(true) before any auth byte; anything else —
+        // including a manifest that set authorized_keys but forgot server_tls — closes here,
+        // before the nonce or any auth bytes, so nothing sensitive crosses a plaintext channel.
+        let _ = tcp_upgrade_to_tls_server(conn.clone()); // no-op "already TLS" when auto-terminated
+        match tcp_is_tls(conn.clone()) {
+            Ok(true) => {}
+            other => {
+                log(format!("[supervisor] control refusing unencrypted channel (is-tls: {:?})", other));
                 let _ = tcp_close(conn);
                 return ok_unit();
             }

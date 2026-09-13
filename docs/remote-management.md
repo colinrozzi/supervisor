@@ -106,15 +106,14 @@ Bootstrap provisions:
 
 ## Security invariants (load-bearing)
 
-- **`authorized_keys` ⇒ `server_tls` is a required invariant.** The guest *infers* an
-  encrypted channel from the `upgrade-to-tls-server` result (Ok = we upgraded; "already
-  TLS" = the handler terminated TLS on accept; anything else = refuse + close *before*
-  any auth byte is sent). It cannot yet *positively assert* the channel is TLS — no such
-  tcp query exists (requested from theater-dev; that assertion is the proper long-term
-  fix). So a hand-written manifest that sets `authorized_keys` without `server_tls` must
-  be avoided. The CLI-emitted manifest enforces this (authed requires `--tls-cert`/`--tls-key`);
-  the VPS bootstrap enforces it too. The guest fails closed, so the failure mode is a
-  refused connection, not a plaintext leak.
+- **`authorized_keys` ⇒ `server_tls` — now a POSITIVE assertion (theater #212).** After
+  attempting `upgrade-to-tls-server` (STARTTLS path), the guest calls `is-tls(conn)` and
+  HARD-requires `Ok(true)` before any auth byte — reading the *live stream variant* as
+  ground truth, so it can't drift from a cached flag or a brittle error-text match. A
+  hand-written manifest that set `authorized_keys` without `server_tls` yields `is-tls =
+  false` → refuse + close *before* the nonce. Fails closed: a refused connection, never a
+  plaintext leak. (The CLI-emitted manifest + the bootstrap also enforce the pairing, but
+  the guest no longer relies on that — it verifies.)
 - **An authorized key is root-equivalent for the control plane.** Authorizing a client
   pubkey grants it full `add`/`remove`/`apply`/`restart` authority — i.e. `runtime.spawn`
   / `stop-actor` over every service this supervisor runs on that box. Treat the allowlist
