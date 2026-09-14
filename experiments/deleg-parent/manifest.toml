@@ -1,0 +1,16 @@
+# MULTI-LEVEL delegation fixture: on init this runtime.spawns a grandchild (the hosted
+# noop), mirroring inbox's acceptor→spine. runtime:inherit → inherits the supervisor's
+# runtime{mutate} so it can spawn. init returns Ok ONLY if the delegated spawn succeeds,
+# so `supervisor list` showing it running == delegation works.
+name = "deleg-parent"
+version = "0.1.0"
+package = "https://raw.githubusercontent.com/colinrozzi/supervisor/main/experiments/deleg-parent/deleg-parent.wasm"
+
+[permission_policy.runtime]
+type = "inherit"
+
+[[handler]]
+type = "self"
+
+[[handler]]
+type = "runtime"

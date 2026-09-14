@@ -1,0 +1,14 @@
+[package]
+name = "deleg-parent"
+version = "0.1.0"
+edition = "2021"
+[workspace]
+[lib]
+crate-type = ["cdylib"]
+[dependencies]
+packr-guest = { version = "0.24.1", features = ["derive"] }
+packr-abi = { version = "0.24.1", default-features = false }
+theater-guest = { git = "https://github.com/colinrozzi/theater", rev = "38ff1accee10497b581d9d683a9d296689c34dc4" }
+[profile.release]
+opt-level = "s"
+lto = true
