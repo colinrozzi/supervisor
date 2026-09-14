@@ -1,0 +1,15 @@
+# 3-level fixture, MIDDLE (B): spawned by top(A); itself spawns C(noop). Proves 2-HOP
+# runtime:inherit — B is 2-below-supervisor and must inherit runtime THROUGH to spawn.
+name = "deleg-mid"
+version = "0.1.0"
+package = "https://raw.githubusercontent.com/colinrozzi/supervisor/main/experiments/deleg-parent/deleg-parent.wasm"
+initial_state = 'https://raw.githubusercontent.com/colinrozzi/supervisor/main/experiments/noop/manifest.toml'
+
+[permission_policy.runtime]
+type = "inherit"
+
+[[handler]]
+type = "self"
+
+[[handler]]
+type = "runtime"

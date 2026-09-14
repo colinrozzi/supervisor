@@ -1,0 +1,15 @@
+# 3-level fixture, TOP (A): spawned by the supervisor; spawns B(mid), which spawns C(noop).
+# Apply this one -> supervisor->A->B->C.  shows A running == the whole 2-hop chain worked.
+name = "deleg-top"
+version = "0.1.0"
+package = "https://raw.githubusercontent.com/colinrozzi/supervisor/main/experiments/deleg-parent/deleg-parent.wasm"
+initial_state = 'https://raw.githubusercontent.com/colinrozzi/supervisor/main/experiments/deleg-parent/manifest-mid.toml'
+
+[permission_policy.runtime]
+type = "inherit"
+
+[[handler]]
+type = "self"
+
+[[handler]]
+type = "runtime"

@@ -76,10 +76,30 @@ fn case_name(v: Value) -> String {
     }
 }
 
+/// The child manifest ref to spawn, from init config (bare String / option / tuple / bytes).
+/// Empty/absent → the default noop leaf. Lets ONE wasm act at ANY tree level: A's manifest
+/// initial_state = B's ref, B's = C's, … so a 3-level A→B→C tree tests 2-HOP runtime:inherit.
+fn config_child(v: Value) -> String {
+    fn s(v: Value) -> Option<String> {
+        match v {
+            Value::String(s) => Some(s),
+            Value::Option { value: Some(b), .. } => s(*b),
+            Value::Tuple(mut it) if !it.is_empty() => s(it.remove(0)),
+            Value::List { items, .. } => {
+                let b: Vec<u8> = items.into_iter().filter_map(|x| if let Value::U8(n) = x { Some(n) } else { None }).collect();
+                String::from_utf8(b).ok()
+            }
+            _ => None,
+        }
+    }
+    s(v).filter(|x| !x.is_empty()).unwrap_or_else(|| String::from(CHILD))
+}
+
 #[export(name = "theater:simple/actor.init")]
-fn init(_config: Value) -> Value {
-    log(String::from("[deleg-parent] init — delegating: runtime.spawn grandchild (noop)"));
-    match runtime_spawn_raw(String::from(CHILD), None, None) {
+fn init(config: Value) -> Value {
+    let child = config_child(config);
+    log(format!("[deleg-parent] init — delegating: runtime.spawn {}", child));
+    match runtime_spawn_raw(child, None, None) {
         Value::Result { value: Ok(inner), .. } => match *inner {
             Value::String(id) => { log(format!("[deleg-parent] DELEGATION OK — grandchild {}", id)); ok_unit() }
             _ => { log(String::from("[deleg-parent] spawn ok, odd payload")); ok_unit() }
