@@ -755,19 +755,54 @@ async fn spawn(args: &SpawnArgs) -> Result<()> {
                     break;
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("\nsupervisor: stopping root {root_id} …");
+            sig = shutdown_signal() => {
+                // Handle BOTH SIGINT (Ctrl+C) and SIGTERM (systemd stop/restart) so a
+                // service stop is a graceful shutdown, not a hard kill. Stop the root
+                // (supervisor) actor so its own teardown runs, then let run() drain.
+                //
+                // NOTE (#15 / theater shutdown work): the runtime is flat — StopActor(root)
+                // does NOT cascade to the supervised children, so their handler resources
+                // (bound ports, store handles) may not release in the orderly path yet. The
+                // correct runtime-wide graceful teardown is being worked out with theater-dev;
+                // this handler is the seam that will invoke it once the primitive lands.
+                eprintln!("\nsupervisor: received {sig} — stopping root {root_id} gracefully …");
                 let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
                 let _ = theater_tx.send(TheaterCommand::StopActor { actor_id: root_id, response_tx: stop_tx });
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stop_rx).await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(10), stop_rx).await;
+                let _ = theater_tx.send(TheaterCommand::ShutdownRuntime);
                 break;
             }
         }
     }
 
     drop(theater_tx);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), runtime_handle).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), runtime_handle).await;
     Ok(())
+}
+
+/// Resolves when a shutdown signal arrives: SIGINT (Ctrl+C) or, on unix, SIGTERM
+/// (what systemd sends on stop/restart). Returns the signal name for logging.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = term.recv() => "SIGTERM",
+            },
+            // If the SIGTERM handler can't install, still honor Ctrl+C.
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl+C"
+    }
 }
 
 // ---- chain rendering ----
