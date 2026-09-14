@@ -756,27 +756,23 @@ async fn spawn(args: &SpawnArgs) -> Result<()> {
                 }
             }
             sig = shutdown_signal() => {
-                // Handle BOTH SIGINT (Ctrl+C) and SIGTERM (systemd stop/restart) so a
-                // service stop is a graceful shutdown, not a hard kill. Stop the root
-                // (supervisor) actor so its own teardown runs, then let run() drain.
-                //
-                // NOTE (#15 / theater shutdown work): the runtime is flat — StopActor(root)
-                // does NOT cascade to the supervised children, so their handler resources
-                // (bound ports, store handles) may not release in the orderly path yet. The
-                // correct runtime-wide graceful teardown is being worked out with theater-dev;
-                // this handler is the seam that will invoke it once the primitive lands.
-                eprintln!("\nsupervisor: received {sig} — stopping root {root_id} gracefully …");
-                let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-                let _ = theater_tx.send(TheaterCommand::StopActor { actor_id: root_id, response_tx: stop_tx });
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(10), stop_rx).await;
+                // Handle BOTH SIGINT (Ctrl+C) and SIGTERM (systemd stop/restart) so a service
+                // stop is a graceful shutdown, not a hard kill. One command does it: theater
+                // #214 makes ShutdownRuntime a full-runtime graceful DRAIN — it signals every
+                // live actor (this supervisor + its roster + their spawned trees) to tear down
+                // (TCP close_notify + listener release, store cleanup, …), pumps until the set
+                // empties, with a 10s deadline backstop. The runtime is flat, so this releases
+                // the WHOLE set with no lineage/cascade — no StopActor(root) needed.
+                eprintln!("\nsupervisor: received {sig} — draining the runtime gracefully …");
                 let _ = theater_tx.send(TheaterCommand::ShutdownRuntime);
                 break;
             }
         }
     }
 
+    // Let the graceful drain complete (or the 15s outer bound trips past #214's 10s deadline).
     drop(theater_tx);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), runtime_handle).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(15), runtime_handle).await;
     Ok(())
 }
 
