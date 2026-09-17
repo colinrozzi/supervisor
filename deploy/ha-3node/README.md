@@ -12,7 +12,7 @@ hosts that box's peer: `{index-node, content-holder}` as roster entries.
 
 Deploy per box: place store-dev's WG-filled `peerN-index.toml`/`peerN-holder.toml` (+ the
 node wasms + the static `store` CLI) under `/etc/store/`, drop `peerN-roster.json` as
-`/etc/store/roster.json`, install + `systemctl enable --now store-supervisor`.
+`/etc/store/roster.json`, install the template; `systemctl enable --now store-supervisor@1 store-supervisor@2 store-supervisor@3` (one per peer).
 
 Boundary: supervision = per-box process resilience + reboot survival ONLY. Cross-machine
 HA (read/content) = the store's RF=3 replication; write-HA = the genesis multi-writer

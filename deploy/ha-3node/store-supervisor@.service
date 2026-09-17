@@ -1,16 +1,22 @@
-# Per-box store-node supervisor (peer N). Install as store-supervisor.service on each box.
-# The supervisor IS the host for that box's store nodes; systemd Restart + boot-enable
-# give reboot durability, and the supervisor's rate-limited reconcile gives crash-restart.
-# Rollback / node cleanup on stop is the v0.3.2 graceful drain (SIGTERM -> ShutdownRuntime).
+# Per-PEER store-node supervisor (systemd template). Run ONE instance per peer:
+#   systemctl enable --now store-supervisor@1 store-supervisor@2 store-supervisor@3
+# so a supervisor crash takes down only ITS peer (the other 2 keep serving; RF=3 quorum
+# survives) — 3 independent failure domains, not one supervisor over all 6 nodes. This is
+# also the future-proof shape: when the peers spread to 3 machines, move each @N unit to
+# its box unchanged (the roster already scopes it to one peer).
+#
+# The supervisor IS the host for that peer's {index-node, content-holder}; Restart=always
+# + boot-enable give reboot durability; the roster's rate-limited reconcile gives
+# crash-restart; stop is the v0.3.2 graceful drain (SIGTERM -> ShutdownRuntime).
 [Unit]
-Description=store-node supervisor (fleet distribution HA peer)
+Description=store-node supervisor (fleet distribution HA peer %i)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# roster = this box's peer (peer1-roster.json on box1, etc.); --logs warn to the journal.
-ExecStart=/usr/local/bin/supervisor spawn /etc/store/roster.json --logs warn
+# %i selects the peer: store-supervisor@1 -> /etc/store/peer1-roster.json, etc.
+ExecStart=/usr/local/bin/supervisor spawn /etc/store/peer%i-roster.json --logs warn
 Restart=always
 RestartSec=2
 
