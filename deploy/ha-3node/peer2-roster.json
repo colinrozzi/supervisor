@@ -1,0 +1,6 @@
+{
+  "services": [
+    { "handle": "store-index-2",  "manifest": "/etc/store/peer2-index.toml",  "max": 10, "window_ms": 60000, "keep_chain": true },
+    { "handle": "store-holder-2", "manifest": "/etc/store/peer2-holder.toml", "max": 10, "window_ms": 60000, "keep_chain": true }
+  ]
+}

@@ -1,0 +1,18 @@
+# Per-box store-node supervisor (peer N). Install as store-supervisor.service on each box.
+# The supervisor IS the host for that box's store nodes; systemd Restart + boot-enable
+# give reboot durability, and the supervisor's rate-limited reconcile gives crash-restart.
+# Rollback / node cleanup on stop is the v0.3.2 graceful drain (SIGTERM -> ShutdownRuntime).
+[Unit]
+Description=store-node supervisor (fleet distribution HA peer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# roster = this box's peer (peer1-roster.json on box1, etc.); --logs warn to the journal.
+ExecStart=/usr/local/bin/supervisor spawn /etc/store/roster.json --logs warn
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

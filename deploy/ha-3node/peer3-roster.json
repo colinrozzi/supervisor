@@ -1,0 +1,6 @@
+{
+  "services": [
+    { "handle": "store-index-3",  "manifest": "/etc/store/peer3-index.toml",  "max": 10, "window_ms": 60000, "keep_chain": true },
+    { "handle": "store-holder-3", "manifest": "/etc/store/peer3-holder.toml", "max": 10, "window_ms": 60000, "keep_chain": true }
+  ]
+}
