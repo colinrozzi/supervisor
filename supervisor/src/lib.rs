@@ -407,8 +407,11 @@ fn find_variant_case(v: &Value, wanted: &[&str]) -> Option<String> {
     }
 }
 
-fn runtime_spawn(manifest: &str) -> Result<String, String> {
-    match runtime_spawn_raw(manifest.to_string(), None, None) {
+/// Spawn from a manifest reference (path/URL/`inline:`) and, for a pushed service,
+/// the wasm bytes handed over the control plane. `wasm=Some` overrides the manifest's
+/// package fetch (the runtime uses the provided bytes); `wasm=None` is the ref path.
+fn runtime_spawn(manifest: &str, wasm: Option<&[u8]>) -> Result<String, String> {
+    match runtime_spawn_raw(manifest.to_string(), None, wasm.map(|b| b.to_vec())) {
         // packr-native result
         Value::Result { value: Ok(inner), .. } => match *inner {
             Value::String(id) => Ok(id),
@@ -467,6 +470,12 @@ struct ServiceCfg {
     /// without a sink. Implies a full-chain watch.
     #[serde(default)]
     keep_chain: Option<bool>,
+    /// PUSH deploy: the actor's wasm bytes, delivered over the control plane (a JSON
+    /// u8 array). When present, `manifest` is treated as inline TOML CONTENT (not a
+    /// ref) — the box fetches nothing: the supervisor spawns from `inline:<manifest>`
+    /// + these bytes, and holds them so it can respawn the child on crash/restart.
+    #[serde(default)]
+    wasm: Option<Vec<u8>>,
 }
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -527,6 +536,11 @@ struct Svc {
     keep_chain: bool,
     /// Capped ring of recent chain events (when record or keep_chain is on).
     chain_buf: Vec<ChainRec>,
+    /// PUSH deploy: the actor's wasm bytes (None = ref service, fetched from
+    /// `manifest`). Held so the supervisor can respawn the child on crash and
+    /// re-spawn it after its own restart — chain-backed state, so it survives a
+    /// supervisor restart with no external fetch. Only a box recycle needs a re-push.
+    wasm: Option<Vec<u8>>,
 }
 impl Svc {
     /// Whether this service is watched on its full chain (vs terminations-only).
@@ -564,8 +578,8 @@ fn config_string(v: Value) -> Option<String> {
 
 /// spawn a service's manifest + watch it; returns the new child id.
 /// `full_chain` true → watch the FULL chain (record/keep every event); false → terminations only.
-fn spawn_and_watch(handle: &str, manifest: &str, full_chain: bool) -> Result<String, String> {
-    let id = runtime_spawn(manifest)?;
+fn spawn_and_watch(handle: &str, manifest: &str, wasm: Option<&[u8]>, full_chain: bool) -> Result<String, String> {
+    let id = runtime_spawn(manifest, wasm)?;
     let sub = if full_chain { monitor(id.clone()) } else { monitor_filtered(id.clone(), terminations()) };
     if let Err(e) = sub {
         log(format!("[supervisor] {} watch({}) failed: {}", handle, id, e));
@@ -582,10 +596,20 @@ fn build_svc(s: ServiceCfg) -> Result<Svc, String> {
     let record = s.record.map(RecordCfg::into_sink);
     let keep_chain = s.keep_chain.unwrap_or(false);
     let full_chain = record.is_some() || keep_chain;
-    let current_id = spawn_and_watch(&s.handle, &s.manifest, full_chain)?;
+    // A pushed service (wasm bytes present) carries its manifest as inline TOML
+    // CONTENT and fetches nothing: spawn from `inline:<toml>` + the pushed bytes.
+    // A ref service carries a manifest reference (path/URL) and no bytes, as before.
+    // Either way `Svc.manifest` becomes a self-contained spawnable string, so the
+    // respawn/restart paths need only it + the held bytes.
+    let manifest = if s.wasm.is_some() {
+        format!("inline:{}", s.manifest)
+    } else {
+        s.manifest
+    };
+    let current_id = spawn_and_watch(&s.handle, &manifest, s.wasm.as_deref(), full_chain)?;
     Ok(Svc {
         handle: s.handle,
-        manifest: s.manifest,
+        manifest,
         max: s.max.unwrap_or(DEFAULT_MAX),
         window_ms: s.window_ms.unwrap_or(DEFAULT_WINDOW_MS),
         current_id,
@@ -595,6 +619,7 @@ fn build_svc(s: ServiceCfg) -> Result<Svc, String> {
         rec_seq: 0,
         keep_chain,
         chain_buf: Vec::new(),
+        wasm: s.wasm,
     })
 }
 
@@ -754,8 +779,9 @@ fn handle_actor_event(input: Value) -> Value {
         // Reconcile: desired-but-now-absent -> respawn (watch mode carries across incarnations).
         let handle = svc.handle.clone();
         let manifest = svc.manifest.clone();
+        let wasm = svc.wasm.clone();
         let full_chain = svc.full_chain();
-        match spawn_and_watch(&handle, &manifest, full_chain) {
+        match spawn_and_watch(&handle, &manifest, wasm.as_deref(), full_chain) {
             Ok(new_id) => {
                 let svc = &mut st.services[idx];
                 svc.current_id = new_id;
@@ -768,6 +794,13 @@ fn handle_actor_event(input: Value) -> Value {
 }
 
 // ---- control surface (JSON over TCP) ---------------------------------------
+
+/// Max bytes for one control line before we give up (a memory bound against an
+/// unbounded/malicious line). Must exceed the largest legitimate op — a PUSH op
+/// carries the actor's wasm as a JSON u8 array (~3.5× the wasm size), so this is
+/// sized for multi-MB actors. The control surface handles one connection at a time,
+/// so this is a transient per-op bound, not a per-connection reservation.
+const MAX_CONTROL_LINE: usize = 32 * 1024 * 1024;
 
 /// Reads '\n'-delimited lines off a connection, buffering across `receive` calls so a
 /// pipelined auth-line + op-line don't get lost. `receive` blocks until data/EOF.
@@ -799,7 +832,7 @@ impl LineReader {
                 }
                 Ok(chunk) => {
                     self.buf.extend_from_slice(&chunk);
-                    if self.buf.len() > 65536 {
+                    if self.buf.len() > MAX_CONTROL_LINE {
                         return Some(core::mem::take(&mut self.buf)); // cap
                     }
                 }
@@ -908,9 +941,20 @@ fn ok_msg(msg: &str) -> String {
     format!("{{\"ok\":true,\"message\":\"{}\"}}", json_escape(msg))
 }
 fn svc_json(s: &Svc) -> String {
+    // A pushed service's manifest is a (potentially large) inline TOML blob — don't
+    // dump it into every `list`/`status`. Show a compact descriptor + the push facts.
+    let pushed = s.wasm.is_some();
+    let manifest_disp = match &s.wasm {
+        Some(bytes) => format!(
+            "inline:({} manifest bytes, {} wasm bytes pushed)",
+            s.manifest.len().saturating_sub("inline:".len()),
+            bytes.len()
+        ),
+        None => s.manifest.clone(),
+    };
     format!(
-        "{{\"handle\":\"{}\",\"manifest\":\"{}\",\"max\":{},\"window_ms\":{},\"recording\":{},\"keep_chain\":{},\"blocked\":{},\"current_id\":\"{}\",\"restarts\":{}}}",
-        json_escape(&s.handle), json_escape(&s.manifest), s.max, s.window_ms,
+        "{{\"handle\":\"{}\",\"manifest\":\"{}\",\"pushed\":{},\"max\":{},\"window_ms\":{},\"recording\":{},\"keep_chain\":{},\"blocked\":{},\"current_id\":\"{}\",\"restarts\":{}}}",
+        json_escape(&s.handle), json_escape(&manifest_disp), pushed, s.max, s.window_ms,
         s.record.is_some(), s.keep_chain, s.blocked, json_escape(&s.current_id), s.restarts.len()
     )
 }
@@ -1049,13 +1093,14 @@ fn handle_op(line: &[u8]) -> String {
                     Some(i) => {
                         let old_id = st.services[i].current_id.clone();
                         let manifest = st.services[i].manifest.clone();
+                        let wasm = st.services[i].wasm.clone();
                         let full_chain = st.services[i].full_chain();
                         // Intentional stop (cause=Stopped) — not respawned by the reconcile path;
                         // we spawn a fresh incarnation ourselves and re-point current_id.
                         if let Err(e) = runtime_stop_actor(&old_id) {
                             log(format!("[supervisor] control: restart stop {} failed: {}", h, e));
                         }
-                        match spawn_and_watch(&h, &manifest, full_chain) {
+                        match spawn_and_watch(&h, &manifest, wasm.as_deref(), full_chain) {
                             Ok(new_id) => {
                                 let svc = &mut st.services[i];
                                 svc.current_id = new_id;

@@ -68,6 +68,7 @@ events automatically — no races on `desired`, no locking.
   {"op":"list"}
   {"op":"status","handle":"crasher"}
   {"op":"add","service":{"handle":"worker","manifest":"./worker.toml","max":5}}
+  {"op":"add","service":{"handle":"landing","manifest":"<inline toml>","wasm":[0,97,...]}}  # push
   {"op":"remove","handle":"crasher"}
   {"op":"apply","services":[ … full roster … ]}
   ```
@@ -85,8 +86,25 @@ supervisor spawn roster.json --control-port 9000     # server (hosts + listens)
 supervisor list                 --port 9000
 supervisor status crasher       --port 9000
 supervisor add worker ./w.toml  --port 9000 [--max 5 --window-ms 60000]
+supervisor push landing --manifest ./m.toml --wasm ./a.wasm --port 9000  # PUSH deploy
 supervisor remove crasher       --port 9000
 ```
+
+### `push` — deploy to a box that fetches nothing
+
+`add`/`apply` reference a manifest the **box** must resolve (a file on it, or a URL it
+can reach). `push` instead ships the actor **to** the supervisor over the control
+plane: it reads a LOCAL manifest + LOCAL `.wasm`, sends the manifest content **inline**
+and the wasm **bytes** (a JSON `u8` array) in one `add` op with a `wasm` field. The
+supervisor spawns from `inline:<manifest>` + those bytes (`runtime.spawn`'s `wasm-bytes`
+overrides the manifest's `package`, so `package` is a don't-care placeholder), and
+**holds the bytes** so it can respawn the child on crash and re-spawn it after its own
+restart — chain-backed state, so a supervisor restart survives with no external fetch.
+Only a box *recycle* (fresh disk / empty chain) needs a re-push.
+
+This is the deploy path for a **bare, disconnected box**: an empty supervisor on `:9000`
+and nothing else — no store node, no reachable artifact host, no shell. Needs theater's
+`inline:` reference scheme (theater #220). See `docs/push-deploy.md`.
 
 (If we ever want zero schema-drift between client and server, a shared `proto` crate
 with the op/roster serde types — used by both the wasm actor and the native client —

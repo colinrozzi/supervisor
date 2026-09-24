@@ -66,6 +66,30 @@ enum Cmd {
         #[command(flatten)]
         conn: ConnArgs,
     },
+    /// PUSH-deploy a service: ship the wasm bytes + inline manifest over the control
+    /// plane so the box fetches nothing. The supervisor spawns from the pushed bytes
+    /// and holds them to respawn on crash/restart. Both --manifest and --wasm are
+    /// LOCAL files on this machine. Ideal for a bare, disconnected box.
+    Push {
+        handle: String,
+        /// Local manifest.toml — its CONTENT is pushed inline (package field is a
+        /// placeholder; the pushed wasm overrides it). Carries config: initial_state
+        /// + handlers.
+        #[arg(long)]
+        manifest: String,
+        /// Local .wasm file whose bytes are pushed over the control channel.
+        #[arg(long)]
+        wasm: String,
+        #[arg(long)]
+        max: Option<u32>,
+        #[arg(long)]
+        window_ms: Option<u64>,
+        /// Keep the child's chain in memory (queryable with `chain`).
+        #[arg(long)]
+        keep_chain: bool,
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
     /// Remove a service (the supervisor stops it).
     Remove {
         handle: String,
@@ -277,6 +301,10 @@ async fn main() {
         Cmd::Add { handle, manifest, max, window_ms, keep_chain, conn } => {
             control_print(conn, &add_op(handle, manifest, *max, *window_ms, *keep_chain))
         }
+        Cmd::Push { handle, manifest, wasm, max, window_ms, keep_chain, conn } => {
+            push_op(handle, manifest, wasm, *max, *window_ms, *keep_chain)
+                .and_then(|op| control_print(conn, &op))
+        }
         Cmd::Apply { roster, conn } => apply_op(roster).and_then(|op| control_print(conn, &op)),
         Cmd::Keygen { out } => keygen(out.as_deref()),
         Cmd::Upgrade { install_dir } => upgrade(install_dir.as_deref()),
@@ -484,6 +512,47 @@ fn add_op(handle: &str, manifest: &str, max: Option<u32>, window_ms: Option<u64>
     }
     svc.push('}');
     format!("{{\"op\":\"add\",\"service\":{}}}", svc)
+}
+
+/// Build a PUSH `add` op: read the LOCAL manifest (content, pushed inline) + the LOCAL
+/// wasm (bytes, pushed as a JSON u8 array). The supervisor sees `wasm` present, treats
+/// `manifest` as inline TOML content, and spawns from `inline:<toml>` + the bytes —
+/// the box fetches nothing.
+fn push_op(
+    handle: &str,
+    manifest_path: &str,
+    wasm_path: &str,
+    max: Option<u32>,
+    window_ms: Option<u64>,
+    keep_chain: bool,
+) -> Result<String> {
+    let manifest = std::fs::read_to_string(manifest_path)
+        .with_context(|| format!("reading manifest {manifest_path}"))?;
+    let wasm = std::fs::read(wasm_path).with_context(|| format!("reading wasm {wasm_path}"))?;
+    if wasm.is_empty() {
+        return Err(anyhow!("wasm file {wasm_path} is empty"));
+    }
+    let mut svc = serde_json::json!({
+        "handle": handle,
+        "manifest": manifest,
+        "wasm": wasm,
+    });
+    if let Some(m) = max {
+        svc["max"] = serde_json::json!(m);
+    }
+    if let Some(w) = window_ms {
+        svc["window_ms"] = serde_json::json!(w);
+    }
+    if keep_chain {
+        svc["keep_chain"] = serde_json::json!(true);
+    }
+    eprintln!(
+        "supervisor: pushing '{}' ({} manifest bytes, {} wasm bytes)",
+        handle,
+        manifest.len(),
+        wasm.len()
+    );
+    Ok(serde_json::json!({ "op": "add", "service": svc }).to_string())
 }
 
 fn load_manifest(args: &SpawnArgs) -> Result<(ManifestConfig, std::path::PathBuf)> {
