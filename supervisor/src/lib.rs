@@ -379,6 +379,23 @@ fn error_detail(v: Value) -> String {
     }
 }
 
+/// Recursively unwrap a nested error variant into a readable chain, so a spawn
+/// failure surfaces its full sub-reason over the control plane instead of a bare
+/// outer case name. E.g. runtime-error::spawn-failed(spawn-failure::bad-manifest(
+/// "missing field version")) → "spawn-failed: bad-manifest: missing field version".
+/// Without this, a remote `push`/`add` that fails needs box-shell access to see WHY.
+fn error_deep(v: Value) -> String {
+    match v {
+        Value::Variant { case_name, payload, .. } => match payload.into_iter().next() {
+            Some(inner @ Value::Variant { .. }) => format!("{}: {}", case_name, error_deep(inner)),
+            Some(Value::String(s)) => format!("{}: {}", case_name, s),
+            _ => case_name,
+        },
+        Value::String(s) => s,
+        _ => String::from("unknown"),
+    }
+}
+
 /// Decode a terminal event's `data` (packr ChainEventPayload) and pull out the
 /// TerminationCause case name — `"Completed" | "Failed" | "Stopped" | "Killed" | "PeerKilled"`.
 /// The payload nests `Variant("Lifecycle",[Variant("Terminated",[<cause>])])`, so we just
@@ -417,14 +434,14 @@ fn runtime_spawn(manifest: &str, wasm: Option<&[u8]>) -> Result<String, String> 
             Value::String(id) => Ok(id),
             _ => Err(String::from("spawn: unexpected ok payload")),
         },
-        Value::Result { value: Err(inner), .. } => Err(error_case(*inner)),
+        Value::Result { value: Err(inner), .. } => Err(error_deep(*inner)),
         // tagged-variant result (other ABI vintage)
         Value::Variant { tag: 0, payload, .. } => match payload.into_iter().next() {
             Some(Value::String(id)) => Ok(id),
             _ => Err(String::from("spawn: unexpected ok payload")),
         },
         Value::Variant { tag: 1, payload, .. } => {
-            Err(payload.into_iter().next().map(error_case).unwrap_or_else(|| String::from("unknown")))
+            Err(payload.into_iter().next().map(error_deep).unwrap_or_else(|| String::from("unknown")))
         }
         // bare string id (defensive)
         Value::String(id) => Ok(id),

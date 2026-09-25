@@ -16,8 +16,27 @@ supervisor push <handle> --manifest <local.toml> --wasm <local.wasm> --profile <
 ```
 
 - `--manifest` — a LOCAL manifest.toml. Its **content** is pushed inline. It carries
-  config only: `initial_state` + `[[handler]]`s + `name`. The `package` field is a
-  **placeholder** (the pushed bytes override it), e.g. `package = "inline:pushed"`.
+  config only: `name`, `version`, `initial_state`, `[[handler]]`s. **`version` is
+  required** — theater rejects a manifest without it at parse time (bare
+  `spawn-failed`/`bad-manifest`). The `package` field is a **placeholder** (the pushed
+  bytes override it), e.g. `package = "inline:pushed"`.
+
+Minimal pushable manifest:
+
+```toml
+name = "static-server"
+version = "0.1.0"          # REQUIRED — omitting it fails the spawn at manifest parse
+package = "inline:pushed"  # placeholder; the pushed wasm bytes override it
+initial_state = """listen=0.0.0.0:80
+content-type=text/html; charset=utf-8
+
+<file body>
+"""
+[[handler]]
+type = "self"
+[[handler]]
+type = "tcp"
+```
 - `--wasm` — a LOCAL `.wasm`. Its **bytes** are pushed (a JSON `u8` array in the op).
 
 The CLI sends one `add` op with a `wasm` field. The supervisor, seeing `wasm` present,
