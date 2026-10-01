@@ -51,20 +51,28 @@ runtime.spawn("inline:<manifest toml>", None, Some(<wasm bytes>))
 [#220]) resolves the manifest content with zero I/O. So **both halves arrive by push,
 neither is fetched**.
 
-## Durability — survives restart, only recycle re-pushes
+## Durability — the supervisor is EPHEMERAL by design
 
-The supervisor **holds the pushed bytes** in the service's in-module state. It must —
-respawning a crashed child is its core job, and it can't respawn bytes it didn't keep.
-Because in-module state is **chain-backed** (state = a replayable projection of the
-chain), the bytes are persisted:
+The supervisor **holds the pushed bytes** in the service's in-module state — it must,
+because respawning a *crashed child* is its core job and it can't respawn bytes it didn't
+keep. That in-memory hold is what survives a **child** crash/restart.
+
+It deliberately does **not** survive its own **process** restart. A fresh supervisor
+process assumes **no state** from the prior run — an empty roster, a clean slate. That is
+the correct, intended model (Colin's ruling): carrying a roster / pushed bytes across the
+supervisor's own restart would leak context from a dead run into a new one. So a process
+restart starts clean, and re-establishing what should be running is a **higher-level
+concern above the supervisor** (a boot/deploy layer — e.g. store-dev's boot-from-store
+auto-heal), explicitly **not** built into the supervisor and not currently assigned to any
+layer. Until such a layer exists, a process restart = a manual re-push. Do **not** add
+durable-chain persistence or reconcile-into-restored-state to the supervisor — the
+simplicity (ephemeral node, single source of truth for durability lives above) is the point.
 
 | Event | Pushed actor |
 |---|---|
-| child **crash** | respawned from held bytes (rate-limited, as any service) |
-| supervisor **process restart** (systemd restart / upgrade) | roster replays from the chain → respawned from held bytes, **no external fetch** |
-| box **recycle** (fresh disk / empty chain) | needs a **re-push** — this is where boot-from-store becomes the later self-healing/auto-boot layer |
-
-So push is **ephemeral-on-recycle**, not ephemeral-on-restart.
+| child **crash** / control-op **restart** | respawned from the held in-memory bytes (rate-limited) — **survives** |
+| supervisor **process restart** (systemd restart / upgrade / reboot) | clean slate — empty roster, pushed services gone **by design**; re-push (or a future boot-from-store layer re-establishes) |
+| box **recycle** | same as a process restart: re-push / re-establish from above |
 
 ## Requirements
 
@@ -75,7 +83,7 @@ So push is **ephemeral-on-recycle**, not ephemeral-on-restart.
 
 ## Trade vs. HTTP boot-pull
 
-Push (this) — box fetches nothing; simplest for a disconnected box; re-push on recycle.
+Push (this) — box fetches nothing; simplest for a disconnected box; re-push on any supervisor process restart/recycle (ephemeral node, above).
 HTTP boot-pull (a manifest/URL ref) — box re-fetches from a store/URL itself, which is
 better for *auto-boot* of a recycled box. They coexist: a service is a ref service or a
 pushed service per its roster entry. Boot-from-store (store content-GET) graduates the
