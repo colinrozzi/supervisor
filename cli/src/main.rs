@@ -116,6 +116,25 @@ enum Cmd {
         #[command(flatten)]
         conn: ConnArgs,
     },
+    /// List EVERY actor in the runtime (id, name, parent-id) — not just this supervisor's
+    /// roster. Use it to discover a grandchild's id (e.g. a driver-spawned node) to `state`.
+    Actors {
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+    /// Dump an actor's RAW in-module state bytes (hex), via runtime.get-actor-state. Target
+    /// by --actor-id (ANY actor, incl. a grandchild — flat runtime) or a roster <handle>
+    /// (its current incarnation). The bytes are the raw module state (for a mesh node = the
+    /// mesh-system wrapper blob), NOT a folded application view — decoding is up to you.
+    State {
+        /// A roster handle (reads its current child's state). Optional if --actor-id given.
+        handle: Option<String>,
+        /// Any actor id in the runtime (overrides <handle>).
+        #[arg(long)]
+        actor_id: Option<String>,
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
     /// Generate an ed25519 client identity keypair. Writes the private key to <OUT>
     /// (chmod 600) and prints the public key hex — add that to the supervisor's
     /// `control.authorized_keys` to authorize this client.
@@ -298,6 +317,16 @@ async fn main() {
         Cmd::Remove { handle, conn } => control_print(conn, &json_op("remove", &[("handle", handle)])),
         Cmd::Restart { handle, conn } => control_print(conn, &json_op("restart", &[("handle", handle)])),
         Cmd::Chain { handle, conn } => control_print(conn, &json_op("chain", &[("handle", handle)])),
+        Cmd::Actors { conn } => control_print(conn, &json_op("actors", &[])),
+        Cmd::State { handle, actor_id, conn } => {
+            let mut fields: Vec<(&str, &str)> = Vec::new();
+            if let Some(a) = actor_id {
+                fields.push(("actor_id", a.as_str()));
+            } else if let Some(h) = handle {
+                fields.push(("handle", h.as_str()));
+            }
+            control_print(conn, &json_op("state", &fields))
+        }
         Cmd::Add { handle, manifest, max, window_ms, keep_chain, conn } => {
             control_print(conn, &add_op(handle, manifest, *max, *window_ms, *keep_chain))
         }
