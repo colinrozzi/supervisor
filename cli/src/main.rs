@@ -452,7 +452,7 @@ fn bootstrap(a: &BootstrapArgs) -> Result<()> {
     // systemd unit.
     let unit_path = out.join(format!("{}.service", a.unit_name));
     let unit = format!(
-        "[Unit]\nDescription=supervisor ({unit}) — authenticated reconciler + host for the supervised tree\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={run}\nRestart=always\nRestartSec=2\n# systemd stop/restart sends SIGTERM → the supervisor hard-kills the tree, then respawns\n# on restart (correct for wedge remediation; not a graceful drain — supervisor task #15).\n# Point any liveness watchdog at THIS unit.\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=supervisor ({unit}) — authenticated reconciler + host for the supervised tree\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={run}\nRestart=always\nRestartSec=2\n# FD headroom: a wedged child's accept loop can accumulate connection FDs; a generous\n# ceiling delays exhaustion + buys recovery time (the agent-inbox.dev wedge lesson — one\n# fd pool per process, a runaway child can starve the control listener too).\nLimitNOFILE=65536\n# systemd stop/restart sends SIGTERM → the supervisor hard-kills the tree, then respawns\n# on restart (correct for wedge remediation; not a graceful drain — supervisor task #15).\n# Point any liveness watchdog at THIS unit.\n\n[Install]\nWantedBy=multi-user.target\n",
         unit = a.unit_name,
         run = run_path.display(),
     );
