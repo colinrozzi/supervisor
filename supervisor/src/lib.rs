@@ -57,6 +57,13 @@ pack_types! {
         spawn-failed(spawn-failure),
         internal(string),
     }
+    // One row per actor in the runtime (runtime.list-actors). parent-id is the spawning
+    // actor (none for roots) — lets a consumer render the tree / find a grandchild's id.
+    record actor-info {
+        id: string,
+        name: string,
+        parent-id: option<string>,
+    }
     record http-header {
         name: string,
         value: string,
@@ -88,6 +95,8 @@ pack_types! {
         theater:simple/runtime {
             spawn: func(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, runtime-error>,
             stop-actor: func(id: string) -> result<_, runtime-error>,
+            list-actors: func() -> result<list<actor-info>, runtime-error>,
+            get-actor-state: func(id: string) -> result<option<list<u8>>, runtime-error>,
         }
         theater:simple/tcp {
             listen: func(address: string) -> result<string, string>,
@@ -446,6 +455,70 @@ fn runtime_spawn(manifest: &str, wasm: Option<&[u8]>) -> Result<String, String> 
         // bare string id (defensive)
         Value::String(id) => Ok(id),
         _ => Err(String::from("spawn: unexpected result")),
+    }
+}
+
+// runtime.list-actors -> result<list<actor-info>, runtime-error>. Inspect op (read-only):
+// every actor in the runtime as (id, name, parent-id). Lets the control plane DISCOVER a
+// grandchild's id (e.g. a driver-spawned node) that isn't one of our roster handles.
+#[import(module = "theater:simple/runtime", name = "list-actors")]
+fn runtime_list_actors_raw() -> Value;
+fn runtime_list_actors() -> Result<Vec<(String, String, Option<String>)>, String> {
+    let ok = match runtime_list_actors_raw() {
+        Value::Result { value: Ok(inner), .. } => *inner,
+        Value::Result { value: Err(inner), .. } => return Err(error_deep(*inner)),
+        Value::Variant { tag: 0, payload, .. } => match payload.into_iter().next() {
+            Some(v) => v,
+            None => return Ok(Vec::new()),
+        },
+        Value::Variant { tag: 1, payload, .. } => {
+            return Err(payload.into_iter().next().map(error_deep).unwrap_or_else(|| String::from("unknown")))
+        }
+        other => other,
+    };
+    let items = match ok {
+        Value::List { items, .. } => items,
+        _ => return Err(String::from("list-actors: unexpected ok payload")),
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        if let Value::Record { fields, .. } = it {
+            let (mut id, mut name, mut parent) = (String::new(), String::new(), None);
+            for (k, val) in fields {
+                match (k.as_str(), val) {
+                    ("id", Value::String(s)) => id = s,
+                    ("name", Value::String(s)) => name = s,
+                    ("parent-id", Value::Option { value: Some(b), .. }) => {
+                        if let Value::String(s) = *b {
+                            parent = Some(s);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.push((id, name, parent));
+        }
+    }
+    Ok(out)
+}
+
+// runtime.get-actor-state(id) returns the actor's STATE as a packr `Value` (via the actor's
+// `actor.get-state` export) — NOT a serialized byte list, despite the pact's nominal
+// `option<list<u8>>` type (theater get_actor_state → Ok(state: Value); a stateless actor is
+// unit `Tuple([])`, a stateful one is its state Record/etc.). So we peel the result to the
+// raw state Value and let the caller re-encode/decode — shape-agnostic.
+#[import(module = "theater:simple/runtime", name = "get-actor-state")]
+fn runtime_get_actor_state_raw(id: String) -> Value;
+fn runtime_get_actor_state(id: &str) -> Result<Value, String> {
+    match runtime_get_actor_state_raw(id.to_string()) {
+        Value::Result { value: Ok(inner), .. } => Ok(*inner),
+        Value::Result { value: Err(inner), .. } => Err(error_deep(*inner)),
+        Value::Variant { tag: 0, payload, .. } => Ok(payload.into_iter().next().unwrap_or(Value::Tuple(Vec::new()))),
+        Value::Variant { tag: 1, payload, .. } => {
+            Err(payload.into_iter().next().map(error_deep).unwrap_or_else(|| String::from("unknown")))
+        }
+        // bare value (defensive: some ABI vintages hand back the state value directly)
+        other => Ok(other),
     }
 }
 
@@ -1132,6 +1205,73 @@ fn handle_op(line: &[u8]) -> String {
                     None => err_reply(&format!("unknown handle '{}'", h)),
                 }
             });
+        }
+        "actors" => {
+            // Read-only: every actor in the runtime (not just our roster). The discovery
+            // step for a grandchild's id — e.g. a driver-spawned node — to then `state` it.
+            reply = match runtime_list_actors() {
+                Ok(list) => {
+                    let items: Vec<String> = list
+                        .iter()
+                        .map(|(id, name, parent)| {
+                            let p = match parent {
+                                Some(pp) => format!("\"{}\"", json_escape(pp)),
+                                None => String::from("null"),
+                            };
+                            format!(
+                                "{{\"id\":\"{}\",\"name\":\"{}\",\"parent_id\":{}}}",
+                                json_escape(id), json_escape(name), p
+                            )
+                        })
+                        .collect();
+                    format!("{{\"ok\":true,\"actors\":[{}]}}", items.join(","))
+                }
+                Err(e) => err_reply(&format!("list-actors failed: {}", e)),
+            };
+        }
+        "state" => {
+            // Read-only: the RAW in-module state bytes of an actor, hex-encoded. Target by
+            // `actor_id` (any actor, incl. a grandchild — flat runtime, inspect-by-id ignores
+            // lineage) or by `handle` (a direct roster child's current incarnation). NOTE the
+            // bytes are the raw module state (for a mesh node = the mesh-system wrapper blob),
+            // NOT a folded application view — the caller decodes.
+            let explicit = v.get("actor_id").and_then(|x| x.as_str()).map(|s| s.to_string());
+            let mut target: Result<String, String> =
+                Err(String::from("state: handle or actor_id required"));
+            match explicit {
+                Some(id) => target = Ok(id),
+                None => {
+                    if let Some(h) = handle_of() {
+                        SupervisorState::with_mut(|st| {
+                            target = st
+                                .services
+                                .iter()
+                                .find(|s| s.handle == h)
+                                .map(|s| s.current_id.clone())
+                                .ok_or_else(|| format!("unknown handle '{}'", h));
+                        });
+                    }
+                }
+            }
+            reply = match target {
+                Err(e) => err_reply(&e),
+                Ok(id) => match runtime_get_actor_state(&id) {
+                    Ok(state_val) => {
+                        // unit state (`Tuple([])`) = the actor holds no meaningful state.
+                        let empty = matches!(&state_val, Value::Tuple(t) if t.is_empty());
+                        // Re-encode the state Value to packr bytes + hex so the caller can
+                        // decode it faithfully (for a mesh node = the SystemState blob).
+                        match packr_guest::encode(&state_val) {
+                            Ok(bytes) => format!(
+                                "{{\"ok\":true,\"actor_id\":\"{}\",\"present\":{},\"state_hex\":\"{}\"}}",
+                                json_escape(&id), !empty, hex(&bytes)
+                            ),
+                            Err(_) => err_reply(&format!("state: failed to encode state of '{}'", id)),
+                        }
+                    }
+                    Err(e) => err_reply(&format!("get-actor-state failed: {}", e)),
+                },
+            };
         }
         other => return err_reply(&format!("unknown op '{}'", other)),
     }
