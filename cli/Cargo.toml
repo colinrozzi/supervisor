@@ -13,9 +13,9 @@ name = "supervisor"
 path = "src/main.rs"
 
 [dependencies]
-theater = { git = "https://github.com/colinrozzi/theater", rev = "d1a9f270bdff0e96548e09bdbda6973292c21477" }
-theater-stage = { git = "https://github.com/colinrozzi/theater", rev = "d1a9f270bdff0e96548e09bdbda6973292c21477" }
-theater-native = { git = "https://github.com/colinrozzi/theater", rev = "d1a9f270bdff0e96548e09bdbda6973292c21477" }
+theater = { git = "https://github.com/colinrozzi/theater", rev = "9bfdf1112ac0ea47f9c1466a70db92fefd996f47" }
+theater-stage = { git = "https://github.com/colinrozzi/theater", rev = "9bfdf1112ac0ea47f9c1466a70db92fefd996f47" }
+theater-native = { git = "https://github.com/colinrozzi/theater", rev = "9bfdf1112ac0ea47f9c1466a70db92fefd996f47" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
